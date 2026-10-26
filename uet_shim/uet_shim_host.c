@@ -142,7 +142,15 @@ static uint64_t mr_off_for(const void *buf, size_t len)
 	uint64_t off = 0;
 	size_t i;
 
-	if ((buf == NULL) || (len == 0))
+	/*
+	 * len == 0 is allowed. uet.c issues a zero-length uet_write_sync()
+	 * as a fence, with a VALID pointer into its registered region and
+	 * immediate data (uet.c:2201). Bailing out on the length turned that
+	 * pointer into NULL on the guest side and the stack rejected it.
+	 * A zero-length range inside the region still has a well-defined
+	 * offset, which is exactly what the stack sees natively.
+	 */
+	if (buf == NULL)
 		return 0;
 
 	pthread_mutex_lock(&mr_lock);
@@ -270,16 +278,23 @@ static int stage_tx(const void *buf, size_t len, struct stage *st)
 	st->off = 0;
 	st->owned = 0;
 
-	if ((buf == NULL) || (len == 0))
+	if (buf == NULL)
 		return 0;
 
 	st->off = mr_off_for(buf, len);
 	if (st->off == 0) {
+		if (len == 0)
+			return 0;     /* nothing to point at and nothing to
+				       * copy: a zero-length buffer outside
+				       * any region has no arena address */
 		st->off = shim_arena_alloc(len);
 		if (st->off == 0)
 			return -FI_ENOMEM;
 		st->owned = 1;
 	}
+
+	if (len == 0)
+		return 0;             /* the offset is set; no bytes to move */
 
 	dst = shim_arena_ptr(st->off, len);
 	if (dst == NULL) {
@@ -299,11 +314,11 @@ static int stage_rx(void *buf, size_t len, struct stage *st)
 	st->off = 0;
 	st->owned = 0;
 
-	if ((buf == NULL) || (len == 0))
+	if (buf == NULL)
 		return 0;
 
 	st->off = mr_off_for(buf, len);
-	if (st->off == 0) {
+	if ((st->off == 0) && (len > 0)) {
 		st->off = shim_arena_alloc(len);
 		if (st->off == 0)
 			return -FI_ENOMEM;

@@ -199,8 +199,25 @@ static size_t cq_fmt_size(enum fi_cq_format fmt)
  */
 static void *arena_in(uint64_t off, size_t len, int64_t *ret)
 {
-	void *p = shim_arena_ptr(off, len);
+	void *p;
 
+	/*
+	 * Offset 0 means "no buffer", not "bad offset".
+	 *
+	 * The arena never hands out offset 0 precisely so it can serve as
+	 * that sentinel, and the host sets it whenever an operation has no
+	 * local buffer. A zero-length uet_write_sync() is exactly that: a
+	 * fence, which uet.c's sync-atomic path issues. Treating it as an
+	 * error failed the whole Sync Group Atomic section with
+	 * "uet_write_sync: Invalid argument".
+	 *
+	 * So NULL is returned without touching *ret, and callers must tell
+	 * the two apart by checking *ret rather than the pointer.
+	 */
+	if (off == 0)
+		return NULL;
+
+	p = shim_arena_ptr(off, len);
 	if (p == NULL) {
 		LOG("rejected arena offset %llu len %zu\n",
 		    (unsigned long long)off, len);
@@ -470,8 +487,9 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		 * at the inline payload and made RMA and atomics impossible.
 		 * Nothing is allocated now, so nothing leaks on close either.
 		 */
+		rsp->ret = 0;
 		buf = arena_in(req->off, len, &rsp->ret);
-		if (buf == NULL)
+		if (rsp->ret != 0)
 			break;
 
 		rsp->ret = uet_mr_reg(hdl_get(req->h1), buf, len,
@@ -584,9 +602,11 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 
 	/* ------------------------------------------------- data path */
 	case SHIM_SEND: {
-		void *buf = arena_in(req->off, req->a2, &rsp->ret);
+		void *buf;
 
-		if (buf == NULL)
+		rsp->ret = 0;
+		buf = arena_in(req->off, req->a2, &rsp->ret);
+		if (rsp->ret != 0)
 			break;
 		/* The arena block belongs to this operation until its
 		 * completion, so the stack may hold this pointer for
@@ -610,10 +630,11 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 			rsp->ret = -EINVAL;
 			break;
 		}
+		rsp->ret = 0;
 		for (i = 0; i < cnt; i++) {
 			iov[i].iov_base = arena_in(req->off + tbl[i].off,
 						   tbl[i].len, &rsp->ret);
-			if (iov[i].iov_base == NULL)
+			if (rsp->ret != 0)
 				break;
 			iov[i].iov_len = tbl[i].len;
 		}
@@ -630,9 +651,11 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		/* straight into the arena: the host already reserved the
 		 * block and will read it when the completion is reaped, so
 		 * nothing is allocated or copied on this side */
-		void *buf = arena_in(req->off, req->a2, &rsp->ret);
+		void *buf;
 
-		if (buf == NULL)
+		rsp->ret = 0;
+		buf = arena_in(req->off, req->a2, &rsp->ret);
+		if (rsp->ret != 0)
 			break;
 		rsp->ret = uet_recv(hdl_get(req->h1), (uint32_t)req->a1,
 				    buf, req->a2, hdl_get(req->h2),
@@ -652,10 +675,11 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 			rsp->ret = -EINVAL;
 			break;
 		}
+		rsp->ret = 0;
 		for (i = 0; i < cnt; i++) {
 			iov[i].iov_base = arena_in(req->off + tbl[i].off,
 						   tbl[i].len, &rsp->ret);
-			if (iov[i].iov_base == NULL)
+			if (rsp->ret != 0)
 				break;
 			iov[i].iov_len = tbl[i].len;
 		}
@@ -679,10 +703,11 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 			rsp->ret = -EINVAL;
 			break;
 		}
+		rsp->ret = 0;
 		for (i = 0; i < cnt; i++) {
 			iov[i].iov_base = arena_in(req->off + tbl[i].off,
 						   tbl[i].len, &rsp->ret);
-			if (iov[i].iov_base == NULL)
+			if (rsp->ret != 0)
 				break;
 			iov[i].iov_len = tbl[i].len;
 		}
@@ -705,10 +730,11 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 			rsp->ret = -EINVAL;
 			break;
 		}
+		rsp->ret = 0;
 		for (i = 0; i < cnt; i++) {
 			iov[i].iov_base = arena_in(req->off + tbl[i].off,
 						   tbl[i].len, &rsp->ret);
-			if (iov[i].iov_base == NULL)
+			if (rsp->ret != 0)
 				break;
 			iov[i].iov_len = tbl[i].len;
 		}
@@ -729,8 +755,9 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 			rsp->ret = -EINVAL;
 			break;
 		}
+		rsp->ret = 0;
 		buf = arena_in(req->off, req->a2, &rsp->ret);
-		if (buf == NULL)
+		if (rsp->ret != 0)
 			break;
 		rsp->ret = uet_tsend(hdl_get(req->h1), (uint32_t)req->a1,
 				     buf, req->a2, hdl_get(req->h2),
@@ -747,8 +774,9 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 			rsp->ret = -EINVAL;
 			break;
 		}
+		rsp->ret = 0;
 		buf = arena_in(req->off, req->a2, &rsp->ret);
-		if (buf == NULL)
+		if (rsp->ret != 0)
 			break;
 		rsp->ret = uet_trecv(hdl_get(req->h1), (uint32_t)req->a1,
 				     buf, req->a2, hdl_get(req->h2),
@@ -781,8 +809,9 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 			rsp->ret = -EINVAL;
 			break;
 		}
+		rsp->ret = 0;
 		buf = arena_in(req->off, ra->len, &rsp->ret);
-		if (buf == NULL)
+		if (rsp->ret != 0)
 			break;
 
 		imm = ra->imm_data;
@@ -874,19 +903,14 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 			rsp->ret = -EINVAL;
 			break;
 		}
-		op_buf = arena_in(aa->op_off, aa->bytes, &rsp->ret);
-		if (op_buf == NULL)
+		/* all three are optional; arena_in() only reports an error
+		 * for an offset that is non-zero AND out of range */
+		rsp->ret = 0;
+		op_buf  = arena_in(aa->op_off,  aa->bytes, &rsp->ret);
+		cmp_buf = arena_in(aa->cmp_off, aa->bytes, &rsp->ret);
+		res_buf = arena_in(aa->res_off, aa->bytes, &rsp->ret);
+		if (rsp->ret != 0)
 			break;
-		if (aa->cmp_off != 0) {
-			cmp_buf = arena_in(aa->cmp_off, aa->bytes, &rsp->ret);
-			if (cmp_buf == NULL)
-				break;
-		}
-		if (aa->res_off != 0) {
-			res_buf = arena_in(aa->res_off, aa->bytes, &rsp->ret);
-			if (res_buf == NULL)
-				break;
-		}
 
 		switch (req->op) {
 		case SHIM_ATOMIC:
