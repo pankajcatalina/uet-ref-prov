@@ -912,7 +912,14 @@ ssize_t uet_cq_read(uet_cq_handle_t cq_handle, void *buf, size_t count)
 			((char *)buf + (i * entry_sz));
 		struct ctx_ent ce = ctx_take((uint64_t)
 					     (uintptr_t)e->op_context);
-		size_t got = e->len;
+		/*
+		 * op_context is the first field of every CQ format, so the
+		 * cast above is always safe. len is NOT: FI_CQ_FORMAT_CONTEXT
+		 * entries are 8 bytes and stop after op_context, so reading
+		 * ->len there would read the next entry.
+		 */
+		size_t got = (entry_sz >= sizeof(struct fi_cq_msg_entry)) ?
+			     e->len : 0;
 
 		e->op_context = ce.context;           /* id -> the app's ptr */
 

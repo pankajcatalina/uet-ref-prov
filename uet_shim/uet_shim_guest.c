@@ -132,6 +132,30 @@ static void hdl_del(shim_handle_t h)
 }
 
 /*
+ * Each completion queue's ENTRY SIZE, remembered from the fi_cq_attr the
+ * host sent when the queue was bound.
+ *
+ * uet_cq_read() writes whichever struct the queue's format selects, and the
+ * four formats are 8, 24, 40 and 48 bytes. ABI 1 always reported 48 because
+ * shim_smoke used FI_CQ_FORMAT_TAGGED; uet.c uses FI_CQ_FORMAT_DATA, so the
+ * host copied 48 bytes into the caller's 40-byte struct and glibc caught it
+ * as "stack smashing detected". The stride has to come from the queue, not
+ * from an assumption.
+ */
+static size_t cq_entry_sz[HDL_MAX];
+
+static size_t cq_fmt_size(enum fi_cq_format fmt)
+{
+	switch (fmt) {
+	case FI_CQ_FORMAT_CONTEXT: return sizeof(struct fi_cq_entry);
+	case FI_CQ_FORMAT_MSG:     return sizeof(struct fi_cq_msg_entry);
+	case FI_CQ_FORMAT_DATA:    return sizeof(struct fi_cq_data_entry);
+	case FI_CQ_FORMAT_TAGGED:  return sizeof(struct fi_cq_tagged_entry);
+	default:                   return sizeof(struct fi_cq_tagged_entry);
+	}
+}
+
+/*
  * Resolve an arena offset that arrived over shared memory.
  *
  * Every data-path case goes through this rather than touching the arena
@@ -341,8 +365,14 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 					  (struct fid_cq *)(uintptr_t)req->a1,
 					  req->a2,
 					  (void *)(uintptr_t)req->a3, &ch);
-		if (rsp->ret == 0)
+		if (rsp->ret == 0) {
 			rsp->h2 = hdl_put(ch);
+			/* remember this queue's stride; CQ_READ needs it */
+			if (rsp->h2 < HDL_MAX)
+				cq_entry_sz[rsp->h2] = (attr != NULL) ?
+					cq_fmt_size(attr->format) :
+					sizeof(struct fi_cq_tagged_entry);
+		}
 		break;
 	}
 
@@ -437,7 +467,10 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 
 	/* ------------------------------------------ completion queue */
 	case SHIM_CQ_READ: {
-		size_t entry_sz = sizeof(struct fi_cq_tagged_entry);
+		size_t entry_sz = ((req->h1 < HDL_MAX) &&
+				   (cq_entry_sz[req->h1] != 0)) ?
+				  cq_entry_sz[req->h1] :
+				  sizeof(struct fi_cq_tagged_entry);
 		/* the whole buffer is available for entries now: received
 		 * bytes are already in the arena, where the host reserved
 		 * them, so nothing has to ride back with the completion */
@@ -653,6 +686,8 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 
 	case SHIM_CQ_CLOSE:
 		rsp->ret = uet_cq_close(hdl_get(req->h1));
+		if (req->h1 < HDL_MAX)
+			cq_entry_sz[req->h1] = 0;
 		hdl_del(req->h1);
 		break;
 
