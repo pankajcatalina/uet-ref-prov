@@ -57,7 +57,17 @@
 #define SHIM_MAX_PAYLOAD   (256u * 1024u)
 #define SHIM_ARENA_ALIGN   64u           /* cache line, so two blocks in
                                           * flight never false-share */
-#define SHIM_MAX_IOV       16            /* bounds a stack array in the guest */
+/*
+ * Must be at least UET_IOV_LIMIT (uet_api_private.h: 64), which is what the
+ * stack itself allows. 16 was enough for the provider - it uses
+ * single-entry iovecs - but uet.c's iov_mode splits a message into up to 64
+ * randomly sized segments, and stage_iov() rejected the whole operation
+ * with -FI_EINVAL, so iov_mode never started.
+ *
+ * The cost is stack: the guest holds iovec[SHIM_MAX_IOV] (1 KiB at 64) and
+ * the host a shim_iov[] table of the same count, both well inside a frame.
+ */
+#define SHIM_MAX_IOV       64
 #define SHIM_NAME_MAX      64
 #define SHIM_AUTH_KEY_MAX  64
 #define SHIM_ADDR_MAX      64            /* struct uet_addr is 32; asserted
