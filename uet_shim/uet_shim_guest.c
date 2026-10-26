@@ -18,15 +18,20 @@
  * FUNCTIONS because the linker demands 25 distinct symbols. This side needs
  * one switch, because it dispatches on an integer.
  *
- * It owns two tables, and the reason there are two is symmetry:
+ * Nothing that crosses the boundary is ever dereferenced as given:
  *
  *   hdl_tbl  pointers THIS side owns (real uet_*_handle_t values). Only an
  *            index crosses, so a corrupt id can never become a pointer
  *            dereference here.
  *
- *   rx_tbl   buffers allocated on the host's behalf by RECV/TRECVV. The
- *            host cannot hand us memory, so we allocate locally and ship
- *            the bytes back with the completion.
+ *   arena_in every data buffer arrives as an OFFSET into the shared region
+ *            and is resolved through one bounds-checked helper, so a
+ *            corrupt offset becomes -EINVAL rather than a wild pointer.
+ *
+ * ABI 1 had a third table, rx_tbl: the host could not hand us memory, so
+ * RECV allocated a guest-side buffer and CQ_READ copied the bytes back
+ * inline with the completion. The arena removed the allocation, the copy
+ * and the table.
  *
  * The host keeps the mirror-image table for the pointers IT owns
  * (the application's void *context).
@@ -42,6 +47,7 @@
 #include "uet_api.h"
 #include "uet_shim.h"
 #include "uet_shim_info.h"
+#include "uet_shim_arena.h"
 
 static int g_verbose = 1;
 
@@ -125,42 +131,24 @@ static void hdl_del(shim_handle_t h)
 	}
 }
 
-/* --------------------------------------------------------------- rx table
- * Receive buffers we allocated for the host, keyed by the host's CONTEXT
- * ID. The completion carries that id back as op_context, so the lookup
- * needs no extra bookkeeping - the key is already in the data.
+/*
+ * Resolve an arena offset that arrived over shared memory.
+ *
+ * Every data-path case goes through this rather than touching the arena
+ * directly, so the bounds check cannot be forgotten in one of them. The
+ * offset comes from the other side of a boundary we do not control: a
+ * corrupt or hostile value must become -EINVAL, never a wild pointer.
  */
-#define RX_MAX 4096
-
-struct rx_ent {
-	void  *buf;
-	size_t len;
-};
-
-static struct rx_ent rx_tbl[RX_MAX];
-
-static void *rx_alloc(uint64_t ctx_id, size_t len)
+static void *arena_in(uint64_t off, size_t len, int64_t *ret)
 {
-	if ((ctx_id == 0) || (ctx_id >= RX_MAX))
-		return NULL;
+	void *p = shim_arena_ptr(off, len);
 
-	free(rx_tbl[ctx_id].buf);             /* a re-post reuses the slot */
-	rx_tbl[ctx_id].buf = calloc(1, (len > 0) ? len : 1);
-	rx_tbl[ctx_id].len = len;
-	return rx_tbl[ctx_id].buf;
-}
-
-/* get and clear in one step: a completion consumes the operation */
-static struct rx_ent rx_take(uint64_t ctx_id)
-{
-	struct rx_ent e = { 0 };
-
-	if ((ctx_id == 0) || (ctx_id >= RX_MAX))
-		return e;
-	e = rx_tbl[ctx_id];
-	rx_tbl[ctx_id].buf = NULL;
-	rx_tbl[ctx_id].len = 0;
-	return e;
+	if (p == NULL) {
+		LOG("rejected arena offset %llu len %zu\n",
+		    (unsigned long long)off, len);
+		*ret = -EINVAL;
+	}
+	return p;
 }
 
 /* ------------------------------------------------------------- eq events
@@ -370,28 +358,23 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		void *buf;
 
 		/*
-		 * Stage A: the host shipped the region's CONTENTS inline, so
-		 * we register a local copy. Correct only for small send-side
-		 * buffers - RMA needs the peer to write into the HOST's
-		 * memory, which an inline copy cannot express. Stage B
-		 * registers an offset into the shared arena instead.
+		 * Register the host's arena block itself - the same physical
+		 * bytes it mapped. That is what makes RMA work: a peer's
+		 * write lands in memory the host can read, with no copy and
+		 * nobody to notify.
+		 *
+		 * ABI 1 registered a local copy here, which capped a region
+		 * at the inline payload and made RMA and atomics impossible.
+		 * Nothing is allocated now, so nothing leaks on close either.
 		 */
-		buf = calloc(1, (len > 0) ? len : 1);
-		if (buf == NULL) {
-			rsp->ret = -ENOMEM;
+		buf = arena_in(req->off, len, &rsp->ret);
+		if (buf == NULL)
 			break;
-		}
-		if (req->payload_len > 0) {
-			size_t n = (req->payload_len > len) ?
-				   len : req->payload_len;
-			memcpy(buf, g_in, n);
-		}
+
 		rsp->ret = uet_mr_reg(hdl_get(req->h1), buf, len,
 				      req->a2, req->a3, req->a4, NULL, &mh);
 		if (rsp->ret == 0)
 			rsp->h2 = hdl_put(mh);
-		else
-			free(buf);            /* otherwise the stack owns it */
 		break;
 	}
 
@@ -454,10 +437,12 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 
 	/* ------------------------------------------ completion queue */
 	case SHIM_CQ_READ: {
-		size_t want = req->a1;
 		size_t entry_sz = sizeof(struct fi_cq_tagged_entry);
-		/* reserve half the buffer for the rx blob appended below */
-		size_t max_ent = (SHIM_MAX_PAYLOAD / 2) / entry_sz;
+		/* the whole buffer is available for entries now: received
+		 * bytes are already in the arena, where the host reserved
+		 * them, so nothing has to ride back with the completion */
+		size_t max_ent = SHIM_MAX_PAYLOAD / entry_sz;
+		size_t want = req->a1;
 		ssize_t n;
 
 		if (want > max_ent)
@@ -469,45 +454,18 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 			break;
 
 		/*
-		 * Reply layout:
-		 *   [ n x fi_cq_tagged_entry ][ received bytes ]
+		 * Reply layout: [ n x fi_cq_tagged_entry ], and that is all.
 		 *
-		 * The host cannot give us its receive buffer, so the bytes
-		 * ride back WITH the completion. a1 tells the host the entry
-		 * stride and a2 where the blob starts.
+		 * ABI 1 appended the received bytes here because the guest
+		 * could not write into the host's buffer. It can now - the
+		 * receive landed directly in the arena - which removes the
+		 * copy, the half-buffer reservation that halved how many
+		 * completions one reply could carry, and the rx bookkeeping
+		 * that went with it.
 		 */
-		{
-			size_t off = (size_t)n * entry_sz;
-			ssize_t i;
-
-			for (i = 0; i < n; i++) {
-				struct fi_cq_tagged_entry *e =
-					(struct fi_cq_tagged_entry *)
-					(g_out + ((size_t)i * entry_sz));
-				uint64_t ctx_id =
-					(uint64_t)(uintptr_t)e->op_context;
-				struct rx_ent re = rx_take(ctx_id);
-				size_t take;
-
-				if (re.buf == NULL)
-					continue;     /* a send completion */
-
-				take = e->len;
-				if (take > re.len)
-					take = re.len;
-				if ((off + take) > SHIM_MAX_PAYLOAD)
-					take = SHIM_MAX_PAYLOAD - off;
-				if (take > 0) {
-					memcpy(g_out + off, re.buf, take);
-					off += take;
-				}
-				free(re.buf);
-			}
-
-			rsp->a1 = entry_sz;
-			rsp->a2 = (size_t)n * entry_sz;
-			rsp->payload_len = (uint32_t)off;
-		}
+		rsp->a1 = entry_sz;
+		rsp->a2 = (size_t)n * entry_sz;
+		rsp->payload_len = (uint32_t)((size_t)n * entry_sz);
 		break;
 	}
 
@@ -519,12 +477,21 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		break;
 
 	/* ------------------------------------------------- data path */
-	case SHIM_SEND:
+	case SHIM_SEND: {
+		void *buf = arena_in(req->off, req->a2, &rsp->ret);
+
+		if (buf == NULL)
+			break;
+		/* The arena block belongs to this operation until its
+		 * completion, so the stack may hold this pointer for
+		 * retransmission. ABI 1 passed g_in, which the next request
+		 * overwrote while the transfer was still in flight. */
 		rsp->ret = uet_send(hdl_get(req->h1), (uint32_t)req->a1,
-				    g_in, req->a2, hdl_get(req->h2),
+				    buf, req->a2, hdl_get(req->h2),
 				    hdl_get(req->a3),
 				    (void *)(uintptr_t)req->a4);
 		break;
+	}
 
 	case SHIM_SENDV: {
 		struct shim_iov *tbl = (struct shim_iov *)g_in;
@@ -538,9 +505,14 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 			break;
 		}
 		for (i = 0; i < cnt; i++) {
-			iov[i].iov_base = g_in + tbl[i].off;
+			iov[i].iov_base = arena_in(req->off + tbl[i].off,
+						   tbl[i].len, &rsp->ret);
+			if (iov[i].iov_base == NULL)
+				break;
 			iov[i].iov_len = tbl[i].len;
 		}
+		if (i != cnt)
+			break;
 		rsp->ret = uet_sendv(hdl_get(req->h1), (uint32_t)req->a1,
 				     iov, cnt, hdl_get(req->h2),
 				     hdl_get(req->a3),
@@ -549,12 +521,13 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 	}
 
 	case SHIM_RECV: {
-		void *buf = rx_alloc(req->a4, req->a2);
+		/* straight into the arena: the host already reserved the
+		 * block and will read it when the completion is reaped, so
+		 * nothing is allocated or copied on this side */
+		void *buf = arena_in(req->off, req->a2, &rsp->ret);
 
-		if (buf == NULL) {
-			rsp->ret = -ENOMEM;
+		if (buf == NULL)
 			break;
-		}
 		rsp->ret = uet_recv(hdl_get(req->h1), (uint32_t)req->a1,
 				    buf, req->a2, hdl_get(req->h2),
 				    hdl_get(req->a3),
@@ -574,9 +547,14 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 			break;
 		}
 		for (i = 0; i < cnt; i++) {
-			iov[i].iov_base = g_in + sizeof(*ta) + tbl[i].off;
+			iov[i].iov_base = arena_in(req->off + tbl[i].off,
+						   tbl[i].len, &rsp->ret);
+			if (iov[i].iov_base == NULL)
+				break;
 			iov[i].iov_len = tbl[i].len;
 		}
+		if (i != cnt)
+			break;
 		rsp->ret = uet_tsendv(hdl_get(req->h1), (uint32_t)req->a1,
 				      iov, cnt, hdl_get(req->h2),
 				      hdl_get(req->a3), ta->tag,
@@ -589,25 +567,21 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		struct shim_iov *tbl =
 			(struct shim_iov *)(g_in + sizeof(*ta));
 		struct iovec iov[SHIM_MAX_IOV];
-		size_t cnt = req->a2, i, total = 0;
-		char *buf;
+		size_t cnt = req->a2, i;
 
 		if (cnt > SHIM_MAX_IOV) {
 			rsp->ret = -EINVAL;
 			break;
 		}
-		for (i = 0; i < cnt; i++)
-			total += tbl[i].len;
-
-		buf = rx_alloc(req->a4, total);
-		if (buf == NULL) {
-			rsp->ret = -ENOMEM;
-			break;
-		}
 		for (i = 0; i < cnt; i++) {
-			iov[i].iov_base = buf + tbl[i].off;
+			iov[i].iov_base = arena_in(req->off + tbl[i].off,
+						   tbl[i].len, &rsp->ret);
+			if (iov[i].iov_base == NULL)
+				break;
 			iov[i].iov_len = tbl[i].len;
 		}
+		if (i != cnt)
+			break;
 		rsp->ret = uet_trecvv(hdl_get(req->h1), (uint32_t)req->a1,
 				      iov, cnt, hdl_get(req->h2),
 				      hdl_get(req->a3), ta->tag, ta->ignore,
@@ -656,6 +630,17 @@ int main(int argc, char **argv)
 	lfd = shim_xport_listen();
 	if (lfd < 0)
 		return 1;
+
+	/*
+	 * Resolution only - the guest never allocates from the arena, the
+	 * host does. Without this every data-path offset would be rejected,
+	 * so fail here rather than one call later.
+	 */
+	if (shim_arena_attach() != 0) {
+		LOG("%s provides no shared region; the arena is required "
+		    "by ABI %u\n", shim_xport_name(), SHIM_ABI_VERSION);
+		return 1;
+	}
 
 	LOG("ready on %s (ifname=%s pds=%s)\n",
 	    shim_xport_name(), getenv("UET_IFNAME"),

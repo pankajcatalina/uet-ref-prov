@@ -62,7 +62,7 @@ COMMON = $(BARE) $(ARENA) uet_shim_info.o
 all: host guest
 
 # ---- checkpoint target: no libfabric, no uet tree ----
-xport_test: xport_test.c $(BARE)
+xport_test: xport_test.c $(BARE) $(ARENA)
 	$(CC) $(CFLAGS_BARE) $^ -o $@
 
 uet_shim_common.o: uet_shim_common.c uet_shim.h
