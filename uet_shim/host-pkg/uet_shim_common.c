@@ -26,6 +26,7 @@ const char *shim_op_name(uint32_t op)
 		[SHIM_GETNAME]      = "GETNAME",
 		[SHIM_DOMAIN]       = "DOMAIN",
 		[SHIM_DOMAIN_CLOSE] = "DOMAIN_CLOSE",
+		[SHIM_PROGRESS]     = "PROGRESS",
 		[SHIM_ENDPOINT]     = "ENDPOINT",
 		[SHIM_EP_ENABLE]    = "EP_ENABLE",
 		[SHIM_EP_CLOSE]     = "EP_CLOSE",

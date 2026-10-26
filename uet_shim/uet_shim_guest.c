@@ -405,6 +405,10 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		break;
 	}
 
+	case SHIM_PROGRESS:
+		rsp->ret = uet_progress(hdl_get(req->h1));
+		break;
+
 	case SHIM_DOMAIN_CLOSE:
 		if ((req->h1 < HDL_MAX) && (dom_fi[req->h1] != NULL))
 			dom_fi[req->h1] = NULL;   /* the stack owns it now */

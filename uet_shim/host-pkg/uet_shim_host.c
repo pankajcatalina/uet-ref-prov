@@ -1387,6 +1387,18 @@ ssize_t uet_trecv(uet_ep_handle_t ep_handle, uint32_t job_id,
 				 NULL, 0, NULL);
 }
 
+/*
+ * The provider's manual-progress hook. Not in the original 25: the provider
+ * copy those were derived from never called it, and a newer one does. One
+ * RPC per call, so if a provider polls it the CQ ring work applies here too.
+ */
+int uet_progress(uet_domain_handle_t domain_handle)
+{
+	struct shim_hdr h = { .h1 = shim_p2h(domain_handle) };
+
+	return (int)shim_rpc(SHIM_PROGRESS, &h, NULL, 0, NULL, 0, NULL);
+}
+
 int uet_cq_close(uet_cq_handle_t cq_handle)
 {
 	struct shim_hdr h = { .h1 = shim_p2h(cq_handle) };

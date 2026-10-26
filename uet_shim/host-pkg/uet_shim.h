@@ -31,7 +31,7 @@
  * side's dependencies in scope.
  */
 
-#define SHIM_ABI_VERSION   2u            /* bump on ANY change below */
+#define SHIM_ABI_VERSION   3u            /* bump on ANY change below */
 #define SHIM_MAGIC         0x53484d31u   /* "SHM1", in every message */
 
 /*
@@ -88,6 +88,7 @@ enum shim_op {
 	/* domain */
 	SHIM_DOMAIN,
 	SHIM_DOMAIN_CLOSE,
+	SHIM_PROGRESS,
 	/* endpoint */
 	SHIM_ENDPOINT,
 	SHIM_EP_ENABLE,
@@ -335,6 +336,11 @@ struct shim_hdr {
  *                    a3 = context id, payload = struct shim_fi_info
  *               out: h1 = domain handle
  * DOMAIN_CLOSE  in:  h1 = domain
+ * PROGRESS      in:  h1 = domain
+ *               The provider's manual-progress hook. One RPC per call, and
+ *               a provider may call it in a poll loop, so it lands on the
+ *               same hot path as CQ_READ - see the gap notes at the end of
+ *               uet_shim_host.c.
  * ENDPOINT      in:  h1 = domain, a1 = ep token, a2 = context id,
  *                    payload = struct shim_fi_info
  *               out: h1 = ep handle
