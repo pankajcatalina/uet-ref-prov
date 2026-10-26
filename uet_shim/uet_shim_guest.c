@@ -144,6 +144,40 @@ static void hdl_del(shim_handle_t h)
  */
 static size_t cq_entry_sz[HDL_MAX];
 
+/*
+ * The fi_info each domain was built from, kept so it can be REFRESHED.
+ *
+ * uet_domain() retains the caller's struct fi_info by pointer, and uet.c
+ * then mutates it - "ctx->info->domain_attr->mr_mode |= FI_MR_PROV_KEY" at
+ * uet.c:844, twenty lines AFTER uet_domain() at 824. Natively the domain
+ * sees that retroactively because it is the same object. The shim can only
+ * send a snapshot, so the guest's copy was frozen before the bit was set,
+ * uet_ep_close() took the wrong MR-cleanup branch, the region's state was
+ * never reset, and uet_mr_close() failed with -FI_EINVAL.
+ *
+ * The host sends the CURRENT flat info with every ENDPOINT call, so that is
+ * the moment to re-apply it. Only domain_attr is refreshed: those are the
+ * fields the stack reads back out of the retained pointer later. If an
+ * application is ever found mutating another sub-attr after uet_domain(),
+ * this is the function to extend.
+ */
+static struct fi_info *dom_fi[HDL_MAX];
+
+static void dom_info_refresh(shim_handle_t dh, const struct shim_fi_info *in)
+{
+	struct fi_info *fi;
+
+	if ((dh >= HDL_MAX) || (dom_fi[dh] == NULL))
+		return;
+
+	fi = dom_fi[dh];
+	if (fi->domain_attr == NULL)
+		return;
+
+	fi->domain_attr->mr_mode = (int)in->domain_mr_mode;
+	fi->domain_attr->mr_cnt  = in->domain_mr_cnt;
+}
+
 static size_t cq_fmt_size(enum fi_cq_format fmt)
 {
 	switch (fmt) {
@@ -314,14 +348,22 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 				      (struct fid_domain *)(uintptr_t)req->a2,
 				      (void *)(uintptr_t)req->a3,
 				      guest_eq_cb, guest_eq_err_cb, &dh);
-		if (rsp->ret == 0)
+		if (rsp->ret == 0) {
 			rsp->h1 = hdl_put(dh);
-		else
+			/* keep it: uet_domain() retained this exact object
+			 * and the application may still mutate its twin on
+			 * the host - see dom_info_refresh() */
+			if (rsp->h1 < HDL_MAX)
+				dom_fi[rsp->h1] = info;
+		} else {
 			fi_freeinfo(info);    /* the stack did not take it */
+		}
 		break;
 	}
 
 	case SHIM_DOMAIN_CLOSE:
+		if ((req->h1 < HDL_MAX) && (dom_fi[req->h1] != NULL))
+			dom_fi[req->h1] = NULL;   /* the stack owns it now */
 		rsp->ret = uet_domain_close(hdl_get(req->h1));
 		hdl_del(req->h1);
 		break;
@@ -336,6 +378,10 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 			rsp->ret = -ENOMEM;
 			break;
 		}
+		/* this payload is the host's CURRENT view of the fi_info the
+		 * domain retained by pointer, so apply any change the
+		 * application made since uet_domain() */
+		dom_info_refresh(req->h1, (struct shim_fi_info *)g_in);
 		rsp->ret = uet_endpoint(hdl_get(req->h1), info,
 					(struct fid_ep *)(uintptr_t)req->a1,
 					(void *)(uintptr_t)req->a2, &eh);
