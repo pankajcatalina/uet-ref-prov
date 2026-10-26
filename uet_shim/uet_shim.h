@@ -31,11 +31,32 @@
  * side's dependencies in scope.
  */
 
-#define SHIM_ABI_VERSION   1u            /* bump on ANY change below */
+#define SHIM_ABI_VERSION   2u            /* bump on ANY change below */
 #define SHIM_MAGIC         0x53484d31u   /* "SHM1", in every message */
 
-/* inline payload cap for stage A; a shared-memory arena replaces this */
+/*
+ * Two ways for bulk data to cross, and the difference matters:
+ *
+ *   inline  - copied into the mailbox, capped at SHIM_MAX_PAYLOAD. Fine for
+ *             control structures, which are small and short-lived.
+ *   arena   - a byte range of the shared region that BOTH sides address, the
+ *             host by pointer and the guest by the same offset. Nothing is
+ *             copied across, so there is no size cap beyond the region, the
+ *             buffer outlives the call (which inline data cannot - the
+ *             mailbox is reused by the next message), and a peer's RMA write
+ *             lands in memory the host can actually read.
+ *
+ * ABI 1 had only the inline path. That capped a message at 256 KiB, made
+ * uet_mr_reg() register a guest-local COPY - so RMA and atomics could not
+ * work at all - and left send buffers pointing at a mailbox that the next
+ * request overwrote.
+ *
+ * hdr.off carries the arena offset. Zero means "not in the arena", so the
+ * first arena byte is never handed out.
+ */
 #define SHIM_MAX_PAYLOAD   (256u * 1024u)
+#define SHIM_ARENA_ALIGN   64u           /* cache line, so two blocks in
+                                          * flight never false-share */
 #define SHIM_MAX_IOV       16            /* bounds a stack array in the guest */
 #define SHIM_NAME_MAX      64
 #define SHIM_AUTH_KEY_MAX  64
@@ -65,6 +86,8 @@ enum shim_op {
 	SHIM_EP_BIND_MR,
 	/* memory region */
 	SHIM_MR_REG,
+	SHIM_MR_REGV,
+	SHIM_MR_REG_PBL,
 	SHIM_MR_KEY,
 	SHIM_MR_ENABLE,
 	SHIM_MR_DISABLE,
@@ -75,12 +98,31 @@ enum shim_op {
 	/* completion queue */
 	SHIM_CQ_READ,
 	SHIM_CQ_READERR,
-	/* data path */
+	SHIM_CQ_CLOSE,
+	/* data path - messaging */
 	SHIM_SEND,
 	SHIM_SENDV,
 	SHIM_RECV,
+	SHIM_RECVV,
+	SHIM_TSEND,
 	SHIM_TSENDV,
+	SHIM_TRECV,
 	SHIM_TRECVV,
+	/* data path - RMA. The provider imports none of these; uet.c's RMA
+	 * and atomic test sections do, which is how the shim gets exercised
+	 * by the stack's own 100-iteration validator rather than by a test
+	 * I wrote myself. */
+	SHIM_WRITE,
+	SHIM_WRITESEG,
+	SHIM_WRITE_SYNC,
+	SHIM_READ,
+	SHIM_READSEG,
+	/* data path - atomics */
+	SHIM_ATOMIC,
+	SHIM_FETCH_ATOMIC,
+	SHIM_COMPARE_ATOMIC,
+	SHIM_QUERY_ATOMIC,
+	SHIM_ATOMIC_SYNC,
 	/* guest -> host, unsolicited. Declared so the protocol has room for
 	 * them and the gap is visible here rather than hidden in a TODO. */
 	SHIM_EVENT_EQ,
@@ -178,12 +220,38 @@ struct shim_tag_args {
 	uint64_t ignore;         /* trecvv only; tsendv sets 0 */
 };
 
+/*
+ * RMA and atomics take more arguments than h1/h2/a1-a4 can hold - uet_write()
+ * alone has nine - so the surplus travels as a fixed struct at the front of
+ * the payload, the same trick shim_tag_args uses for tagged messaging.
+ */
+struct shim_rma_args {
+	uint64_t remote_addr;
+	uint64_t remote_key;
+	uint64_t len;
+	uint64_t seg_off;        /* writeseg/readseg only; 0 otherwise */
+};
+
+struct shim_atomic_args {
+	uint64_t remote_addr;
+	uint64_t remote_key;
+	uint64_t len;
+	uint64_t cmp_off;        /* compare_atomic: arena offset of the
+				  * compare operand, 0 otherwise         */
+	uint64_t res_off;        /* fetch/compare: arena offset of the
+				  * result buffer, 0 otherwise           */
+	uint32_t atomic_op;
+	uint32_t datatype;
+	uint32_t count;
+	uint32_t _pad;           /* keep the struct 8-byte aligned */
+};
+
 /* --------------------------------------------------------------- messages
  * Fixed 72-byte header, then payload_len bytes.
  *
  * Field order is deliberate: four uint32_t first fill exactly 16 bytes, so
  * every 8-byte field lands naturally aligned and there is NO implicit
- * padding. That is what lets the transport assert sizeof() == 72.
+ * padding. That is what lets the transport assert sizeof() == 80.
  */
 struct shim_hdr {
 	uint32_t magic;          /* SHIM_MAGIC, checked before anything else */
@@ -195,6 +263,9 @@ struct shim_hdr {
 	shim_handle_t h1;        /* primary handle, IN and OUT               */
 	shim_handle_t h2;        /* secondary handle (mr, addr, cq)          */
 	uint64_t a1, a2, a3, a4; /* op-specific scalars                      */
+	uint64_t off;            /* arena offset of this op's data buffer, or
+				  * 0 for "none" - which is why the arena
+				  * never hands out offset 0              */
 };
 
 /*
@@ -241,13 +312,38 @@ struct shim_hdr {
  *                    a3 = src addr handle, a4 = context id
  * TSENDV        as SENDV, payload prefixed by struct shim_tag_args
  * TRECVV        as TSENDV (uses .ignore too)
+ * TSEND         as SEND,  payload prefixed by struct shim_tag_args
+ * TRECV         as RECV,  payload prefixed by struct shim_tag_args
+ * RECVV         as RECV,  a2 = iov_count, payload = shim_iov[]
+ * CQ_CLOSE      in:  h1 = cq
+ * MR_REGV       in:  h1 = domain, a1 = iov_count, a2 = access,
+ *                    a3 = requested_key, a4 = flags,
+ *                    payload = shim_iov[] whose offsets are ARENA offsets
+ *               out: h2 = mr handle
+ * MR_REG_PBL    as MR_REGV; the page list is the shim_iov[]
+ *
+ * The RMA and atomic ops all take h1 = ep, h2 = mr, a1 = job_id,
+ * a3 = dst addr handle, a4 = context id, off = arena offset of the LOCAL
+ * buffer, and carry their remaining arguments in the payload:
+ *
+ * WRITE         payload = struct shim_rma_args
+ * READ          payload = struct shim_rma_args
+ * WRITESEG      payload = struct shim_rma_args (uses .seg_off)
+ * READSEG       payload = struct shim_rma_args (uses .seg_off)
+ * WRITE_SYNC    payload = struct shim_rma_args
+ * ATOMIC        payload = struct shim_atomic_args
+ * FETCH_ATOMIC  payload = struct shim_atomic_args (uses .res_off)
+ * COMPARE_ATOMIC payload = struct shim_atomic_args (.cmp_off + .res_off)
+ * ATOMIC_SYNC   payload = struct shim_atomic_args
+ * QUERY_ATOMIC  in:  h1 = uet, a1 = atomic_op, a2 = datatype, a3 = flags
+ *               out: ret = 0 on supported
  * EVENT_EQ      guest -> host: a1 = context id, payload = the event
  * EVENT_EQ_ERR  guest -> host: a1 = context id, payload = the event
  */
 
 /* -------------------------------------------------------------- transport
  * Deliberately tiny. uet_shim_host.c and uet_shim_guest.c call ONLY these
- * six, and mention neither shared memory nor sockets - which is what lets
+ * seven, and mention neither shared memory nor sockets - which is what lets
  * the transport be replaced without touching either of them.
  *
  * connect/listen take no arguments: each transport reads its own config
@@ -257,6 +353,15 @@ struct shim_hdr {
  * The int fd is vestigial, from the vsock original. Shared memory has no
  * descriptor and returns a sentinel it then ignores.
  */
+/*
+ * The arena. Both sides map the same bytes at different virtual addresses,
+ * so the only portable currency is an offset: the host allocates and gets
+ * back an offset, the guest turns that offset into its own pointer. A
+ * transport with no shared region returns NULL and *len = 0, and the host
+ * then falls back to inline payloads.
+ */
+void *shim_xport_arena(size_t *len);
+
 const char *shim_xport_name(void);                     /* for logs  */
 int  shim_xport_connect(void);                         /* host      */
 int  shim_xport_listen(void);                          /* guest     */

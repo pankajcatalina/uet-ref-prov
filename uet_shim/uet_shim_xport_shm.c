@@ -36,9 +36,30 @@
 #include "uet_shim.h"
 
 #define SHM_DEFAULT_PATH   "/dev/shm/uet_dp"
-#define SHM_REGION_SIZE    (16u << 20)        /* must match QEMU size= and
-					       * the dd; power of two, because
-					       * pci_register_bar() asserts it */
+/*
+ * Must match QEMU's size= exactly, and must be a power of two because
+ * pci_register_bar() asserts it.
+ *
+ * 256 MiB, up from ABI 1's 16 MiB, because the arena now has to hold every
+ * live memory region plus every in-flight transfer rather than just two
+ * 256 KiB mailboxes. 256 MiB and not more because the guest firmware has to
+ * assign this as a prefetchable BAR out of its PCI window, and a larger one
+ * can fail assignment depending on machine type - a failure that costs a VM
+ * restart to diagnose. Raising it later is this constant plus QEMU's size=;
+ * check the result with "lspci -v -s 00:04.0" and look for [size=...].
+ */
+#define SHM_REGION_SIZE    (256u << 20)
+
+/*
+ * The region is cut in two. The channel sits at offset 0 so its compile-time
+ * offsets are unchanged from ABI 1; the arena takes everything from
+ * SHM_ARENA_OFF on.
+ *
+ * 2 MiB, not sizeof(struct shm_chan), for two reasons: a transparent
+ * hugepage can then back the arena, and the channel can grow later without
+ * moving a single arena byte.
+ */
+#define SHM_ARENA_OFF      (2u << 20)
 #define SHM_CHAN_MAGIC     0x55455443u        /* "UETC" - marks the REGION;
 					       * SHIM_MAGIC marks a MESSAGE  */
 #define SHM_PSEUDO_FD      1000               /* not a real descriptor: the
@@ -111,7 +132,7 @@ struct shm_chan {
  * layout change, update these numbers AND bump SHIM_ABI_VERSION so a
  * half-deployed pair refuses to connect.
  */
-_Static_assert(sizeof(struct shim_hdr) == 72, "shim_hdr layout changed");
+_Static_assert(sizeof(struct shim_hdr) == 80, "shim_hdr layout changed");
 _Static_assert(offsetof(struct shim_hdr, op) == 4, "hdr.op moved");
 _Static_assert(offsetof(struct shim_hdr, payload_len) == 8, "hdr.len moved");
 _Static_assert(offsetof(struct shim_hdr, seq) == 12, "hdr.seq moved");
@@ -119,12 +140,14 @@ _Static_assert(offsetof(struct shim_hdr, seq) == 12, "hdr.seq moved");
 _Static_assert(offsetof(struct shm_box, seq) == 0, "box.seq moved");
 _Static_assert(offsetof(struct shm_box, len) == 64, "box.seq lost its line");
 _Static_assert(offsetof(struct shm_box, hdr) == 72, "box.hdr moved");
-_Static_assert(offsetof(struct shm_box, data) == 144, "box.data moved");
+_Static_assert(offsetof(struct shm_box, data) == 152, "box.data moved");
 
 _Static_assert(offsetof(struct shm_chan, h2g) == 64, "h2g moved");
-_Static_assert(offsetof(struct shm_chan, g2h) == 262352, "g2h moved");
-_Static_assert(sizeof(struct shm_chan) <= SHM_REGION_SIZE,
-	       "channel does not fit the region");
+_Static_assert(offsetof(struct shm_chan, g2h) == 262360, "g2h moved");
+_Static_assert(sizeof(struct shm_chan) <= SHM_ARENA_OFF,
+	       "the channel has grown into the arena");
+_Static_assert(SHM_ARENA_OFF < SHM_REGION_SIZE,
+	       "no room left for an arena");
 
 /* A performance property, asserted: put the two doorbells within a cache
  * line of each other and the build refuses, because the false sharing would
@@ -144,6 +167,24 @@ const char *shim_xport_name(void)
 }
 
 /* --------------------------------------------------------------- mapping */
+
+/*
+ * The arena, for uet_shim_host.c to allocate from and uet_shim_guest.c to
+ * resolve offsets against. Valid only once the region is mapped, which is
+ * why it reads g_chan rather than keeping a second base pointer: one
+ * variable, one lifetime.
+ */
+void *shim_xport_arena(size_t *len)
+{
+	if (g_chan == NULL) {
+		if (len != NULL)
+			*len = 0;
+		return NULL;
+	}
+	if (len != NULL)
+		*len = SHM_REGION_SIZE - SHM_ARENA_OFF;
+	return (char *)g_chan + SHM_ARENA_OFF;
+}
 
 static void *map_path(const char *path, int create)
 {
@@ -171,16 +212,22 @@ static void *map_path(const char *path, int create)
 	}
 
 	/*
-	 * Keep it resident. ftruncate() leaves a SPARSE file, so mlock here
-	 * does double duty: it pins the pages and forces them in. A major
-	 * fault on a swapped page turns a 100 ns load into milliseconds,
-	 * which can exceed the 5 ms PDS retransmit timeout and look exactly
-	 * like packet loss.
+	 * Keep the CHANNEL resident. ftruncate() leaves a SPARSE file, so
+	 * mlock here does double duty: it pins the pages and forces them in.
+	 * A major fault on a swapped page turns a 100 ns load into
+	 * milliseconds, which can exceed the 5 ms PDS retransmit timeout and
+	 * look exactly like packet loss.
+	 *
+	 * Only the channel, deliberately. ABI 1 pinned the whole 16 MiB
+	 * region; pinning all 256 MiB would commit a quarter gigabyte of RAM
+	 * on each side before a single byte is used, and the arena is bulk
+	 * data where one extra minor fault per new page is irrelevant. The
+	 * channel is the latency-critical part and it is under 512 KiB.
 	 *
 	 * Warn rather than fail: unpinned still works, it just loses the
 	 * guarantee. Privileged processes bypass RLIMIT_MEMLOCK entirely.
 	 */
-	if (mlock(p, SHM_REGION_SIZE) != 0)
+	if (mlock(p, sizeof(struct shm_chan)) != 0)
 		fprintf(stderr, "[shim/shm] mlock: %s (continuing unpinned; "
 				"raise RLIMIT_MEMLOCK to fix)\n",
 			strerror(errno));

@@ -1,6 +1,7 @@
 # uet_shim - the uet_api.h boundary between the container and the QEMU guest
 #
 #   make xport_test   transport only: needs NO libfabric, NO uet tree
+#   make arena_test   allocator only: needs NO shared memory either
 #   make host         uet_shim_host.o + friends, for the container
 #   make guest        uet_shim_guest, for the VM
 #   make shim_smoke   drives the shim as uet_provider does
@@ -52,7 +53,11 @@ RPATH_LF = -Wl,-rpath,$(abspath $(LIBFABRIC)/src/.libs)
 RPATH    = -Wl,-rpath,'$$ORIGIN/..' -Wl,-rpath,$(abspath $(UETDIR)) $(RPATH_LF)
 
 BARE   = uet_shim_common.o $(XPORT_OBJ)
-COMMON = $(BARE) uet_shim_info.o
+# The arena needs only uet_shim.h, so it builds with CFLAGS_BARE like the
+# transport - but xport_test has no use for it, so it joins COMMON rather
+# than BARE and the transport checkpoint stays as small as it was.
+ARENA  = uet_shim_arena.o
+COMMON = $(BARE) $(ARENA) uet_shim_info.o
 
 all: host guest
 
@@ -64,6 +69,12 @@ uet_shim_common.o: uet_shim_common.c uet_shim.h
 	$(CC) $(CFLAGS_BARE) -c $< -o $@
 uet_shim_xport_shm.o: uet_shim_xport_shm.c uet_shim.h
 	$(CC) $(CFLAGS_BARE) -c $< -o $@
+uet_shim_arena.o: uet_shim_arena.c uet_shim.h uet_shim_arena.h
+	$(CC) $(CFLAGS_BARE) -c $< -o $@
+
+# ---- checkpoint target: the allocator alone, no shm, no stack ----
+arena_test: arena_test.c uet_shim_arena.c uet_shim.h uet_shim_arena.h
+	$(CC) $(CFLAGS_BARE) arena_test.c uet_shim_arena.c -o $@
 uet_shim_xport_vsock.o: uet_shim_xport_vsock.c uet_shim.h
 	$(CC) $(CFLAGS_BARE) -c $< -o $@
 
@@ -75,6 +86,20 @@ host: uet_shim_host.o $(COMMON)
 guest: uet_shim_guest
 uet_shim_guest: uet_shim_guest.o $(COMMON)
 	$(CC) $^ -o $@ -L$(UETDIR) -luet_fabric $(LDLIBS) $(RPATH)
+
+# A drop-in replacement for libuet_fabric.so. libuetprov-fi.so leaves the 25
+# uet_* symbols UNDEFINED and resolves them from the process's global scope at
+# load time, so nothing above uet_api.h has to be relinked: preload this
+# instead of libuet_fabric.so and the same provider, libfabric, NCCL plugin and
+# application run unchanged, with SES/PDS executing inside the guest.
+PICOBJ = uet_shim_host.pic.o uet_shim_info.pic.o uet_shim_common.pic.o \
+         uet_shim_arena.pic.o uet_shim_xport_$(XPORT).pic.o
+
+libuet_shim_host.so: $(PICOBJ)
+	$(CC) -shared $^ -o $@ $(LDLIBS) $(RPATH_LF)
+
+%.pic.o: %.c uet_shim.h uet_shim_info.h uet_shim_arena.h
+	$(CC) $(CFLAGS) -fPIC -c $< -o $@
 
 shim_smoke: shim_smoke.c uet_shim_host.o $(COMMON)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS) $(RPATH_LF)
@@ -93,6 +118,7 @@ uet_shim_guest.o: uet_shim_guest.c uet_shim.h uet_shim_info.h
 # build below proves that rather than asserting it.
 HOST_PKG_FILES = uet_shim.h uet_shim_info.h uet_shim_info.c \
                  uet_shim_common.c uet_shim_xport_shm.c \
+                 uet_shim_arena.h uet_shim_arena.c arena_test.c \
                  uet_shim_host.c shim_smoke.c xport_test.c
 
 host-pkg:
@@ -108,7 +134,8 @@ host-pkg:
 	@echo "stack sources included: $$(ls host-pkg/ | grep -cE '^(uet_api|uet_pds|uet_sec)\.c|^nic_') (must be 0)"
 
 clean:
-	rm -f *.o uet_shim_guest xport_test shim_smoke
+	rm -f *.o *.pic.o libuet_shim_host.so uet_shim_guest xport_test \
+	      shim_smoke arena_test
 	rm -rf host-pkg
 
 .PHONY: all host guest clean host-pkg
