@@ -67,6 +67,8 @@ void shim_info_flatten(const struct fi_info *in, struct shim_fi_info *out)
 		return;
 
 	out->caps = in->caps;
+	out->mode = in->mode;
+	out->addr_format = in->addr_format;
 
 	CPY_BLOB(out->src_addr, out->src_addrlen,
 		 in->src_addr, in->src_addrlen);
@@ -81,6 +83,28 @@ void shim_info_flatten(const struct fi_info *in, struct shim_fi_info *out)
 	}
 
 	if (in->domain_attr != NULL) {
+		out->domain_caps            = in->domain_attr->caps;
+		out->domain_mode            = in->domain_attr->mode;
+		out->domain_cq_data_size    = in->domain_attr->cq_data_size;
+		out->domain_cq_cnt          = in->domain_attr->cq_cnt;
+		out->domain_ep_cnt          = in->domain_attr->ep_cnt;
+		out->domain_tx_ctx_cnt      = in->domain_attr->tx_ctx_cnt;
+		out->domain_rx_ctx_cnt      = in->domain_attr->rx_ctx_cnt;
+		out->domain_max_ep_tx_ctx   = in->domain_attr->max_ep_tx_ctx;
+		out->domain_max_ep_rx_ctx   = in->domain_attr->max_ep_rx_ctx;
+		out->domain_cntr_cnt        = in->domain_attr->cntr_cnt;
+		out->domain_mr_iov_limit    = in->domain_attr->mr_iov_limit;
+		out->domain_max_err_data    = in->domain_attr->max_err_data;
+		out->domain_threading       = (uint32_t)in->domain_attr->threading;
+		out->domain_control_progress =
+			(uint32_t)in->domain_attr->control_progress;
+		out->domain_data_progress   =
+			(uint32_t)in->domain_attr->data_progress;
+		out->domain_resource_mgmt   =
+			(uint32_t)in->domain_attr->resource_mgmt;
+		out->domain_av_type         = (uint32_t)in->domain_attr->av_type;
+		out->domain_tclass          = in->domain_attr->tclass;
+
 		CPY_STR(out->domain_name, in->domain_attr->name);
 		out->domain_mr_mode     = in->domain_attr->mr_mode;
 		out->domain_mr_cnt      = in->domain_attr->mr_cnt;
@@ -94,6 +118,17 @@ void shim_info_flatten(const struct fi_info *in, struct shim_fi_info *out)
 		out->ep_max_msg_size = in->ep_attr->max_msg_size;
 		CPY_BLOB(out->ep_auth_key, out->ep_auth_key_size,
 			 in->ep_attr->auth_key, in->ep_attr->auth_key_size);
+
+		out->ep_type              = (uint32_t)in->ep_attr->type;
+		out->ep_protocol          = in->ep_attr->protocol;
+		out->ep_protocol_version  = in->ep_attr->protocol_version;
+		out->ep_tx_ctx_cnt        = (uint32_t)in->ep_attr->tx_ctx_cnt;
+		out->ep_rx_ctx_cnt        = (uint32_t)in->ep_attr->rx_ctx_cnt;
+		out->ep_msg_prefix_size   = in->ep_attr->msg_prefix_size;
+		out->ep_max_order_raw_size = in->ep_attr->max_order_raw_size;
+		out->ep_max_order_war_size = in->ep_attr->max_order_war_size;
+		out->ep_max_order_waw_size = in->ep_attr->max_order_waw_size;
+		out->ep_mem_tag_format    = in->ep_attr->mem_tag_format;
 	}
 
 	if (in->tx_attr != NULL) {
@@ -102,11 +137,21 @@ void shim_info_flatten(const struct fi_info *in, struct shim_fi_info *out)
 		out->tx_rma_iov_limit = in->tx_attr->rma_iov_limit;
 		out->tx_msg_order     = in->tx_attr->msg_order;
 		out->tx_tclass        = in->tx_attr->tclass;
+		out->tx_caps          = in->tx_attr->caps;
+		out->tx_mode          = in->tx_attr->mode;
+		out->tx_op_flags      = in->tx_attr->op_flags;
+		out->tx_comp_order    = in->tx_attr->comp_order;
+		out->tx_inject_size   = in->tx_attr->inject_size;
 	}
 
 	if (in->rx_attr != NULL) {
 		out->rx_size      = in->rx_attr->size;
 		out->rx_iov_limit = in->rx_attr->iov_limit;
+		out->rx_caps      = in->rx_attr->caps;
+		out->rx_mode      = in->rx_attr->mode;
+		out->rx_op_flags  = in->rx_attr->op_flags;
+		out->rx_comp_order = in->rx_attr->comp_order;
+		out->rx_total_buffered_recv = in->rx_attr->total_buffered_recv;
 	}
 
 	/*
@@ -224,6 +269,9 @@ struct fi_info *shim_info_build(const struct shim_fi_info *in)
 
 	/* Set the length only when the allocation succeeded. A non-zero
 	 * addrlen with a NULL addr would make the stack read from NULL. */
+	fi->mode = in->mode;
+	fi->addr_format = (uint32_t)in->addr_format;
+
 	fi->src_addr = dup_blob(in->src_addr, in->src_addrlen);
 	fi->src_addrlen = (fi->src_addr != NULL) ? in->src_addrlen : 0;
 
@@ -245,20 +293,64 @@ struct fi_info *shim_info_build(const struct shim_fi_info *in)
 		(fi->domain_attr->auth_key != NULL) ?
 		in->domain_auth_key_size : 0;
 
+	fi->domain_attr->caps          = in->domain_caps;
+	fi->domain_attr->mode          = in->domain_mode;
+	fi->domain_attr->cq_data_size  = in->domain_cq_data_size;
+	fi->domain_attr->cq_cnt        = in->domain_cq_cnt;
+	fi->domain_attr->ep_cnt        = in->domain_ep_cnt;
+	fi->domain_attr->tx_ctx_cnt    = in->domain_tx_ctx_cnt;
+	fi->domain_attr->rx_ctx_cnt    = in->domain_rx_ctx_cnt;
+	fi->domain_attr->max_ep_tx_ctx = in->domain_max_ep_tx_ctx;
+	fi->domain_attr->max_ep_rx_ctx = in->domain_max_ep_rx_ctx;
+	fi->domain_attr->cntr_cnt      = in->domain_cntr_cnt;
+	fi->domain_attr->mr_iov_limit  = in->domain_mr_iov_limit;
+	fi->domain_attr->max_err_data  = in->domain_max_err_data;
+	fi->domain_attr->threading     =
+		(enum fi_threading)in->domain_threading;
+	fi->domain_attr->control_progress =
+		(enum fi_progress)in->domain_control_progress;
+	fi->domain_attr->data_progress =
+		(enum fi_progress)in->domain_data_progress;
+	fi->domain_attr->resource_mgmt =
+		(enum fi_resource_mgmt)in->domain_resource_mgmt;
+	fi->domain_attr->av_type       = (enum fi_av_type)in->domain_av_type;
+	fi->domain_attr->tclass        = in->domain_tclass;
+
 	fi->ep_attr->max_msg_size = in->ep_max_msg_size;
 	fi->ep_attr->auth_key     = dup_blob(in->ep_auth_key,
 					     in->ep_auth_key_size);
 	fi->ep_attr->auth_key_size =
 		(fi->ep_attr->auth_key != NULL) ? in->ep_auth_key_size : 0;
 
+	fi->ep_attr->type              = (enum fi_ep_type)in->ep_type;
+	fi->ep_attr->protocol          = in->ep_protocol;
+	fi->ep_attr->protocol_version  = in->ep_protocol_version;
+	fi->ep_attr->tx_ctx_cnt        = in->ep_tx_ctx_cnt;
+	fi->ep_attr->rx_ctx_cnt        = in->ep_rx_ctx_cnt;
+	fi->ep_attr->msg_prefix_size   = in->ep_msg_prefix_size;
+	fi->ep_attr->max_order_raw_size = in->ep_max_order_raw_size;
+	fi->ep_attr->max_order_war_size = in->ep_max_order_war_size;
+	fi->ep_attr->max_order_waw_size = in->ep_max_order_waw_size;
+	fi->ep_attr->mem_tag_format    = in->ep_mem_tag_format;
+
 	fi->tx_attr->size          = in->tx_size;
 	fi->tx_attr->iov_limit     = in->tx_iov_limit;
 	fi->tx_attr->rma_iov_limit = in->tx_rma_iov_limit;
 	fi->tx_attr->msg_order     = in->tx_msg_order;
 	fi->tx_attr->tclass        = in->tx_tclass;
+	fi->tx_attr->caps          = in->tx_caps;
+	fi->tx_attr->mode          = in->tx_mode;
+	fi->tx_attr->op_flags      = in->tx_op_flags;
+	fi->tx_attr->comp_order    = in->tx_comp_order;
+	fi->tx_attr->inject_size   = in->tx_inject_size;
 
 	fi->rx_attr->size      = in->rx_size;
 	fi->rx_attr->iov_limit = in->rx_iov_limit;
+	fi->rx_attr->caps      = in->rx_caps;
+	fi->rx_attr->mode      = in->rx_mode;
+	fi->rx_attr->op_flags  = in->rx_op_flags;
+	fi->rx_attr->comp_order = in->rx_comp_order;
+	fi->rx_attr->total_buffered_recv = in->rx_total_buffered_recv;
 
 	/*
 	 * info->nic, rebuilt. ABI 1 left this NULL because the provider only

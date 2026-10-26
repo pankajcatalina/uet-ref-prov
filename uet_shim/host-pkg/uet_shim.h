@@ -31,7 +31,7 @@
  * side's dependencies in scope.
  */
 
-#define SHIM_ABI_VERSION   3u            /* bump on ANY change below */
+#define SHIM_ABI_VERSION   4u            /* bump on ANY change below */
 #define SHIM_MAGIC         0x53484d31u   /* "SHM1", in every message */
 
 /*
@@ -180,6 +180,9 @@ typedef uint64_t shim_handle_t;
  */
 struct shim_fi_info {
 	uint64_t caps;
+	uint64_t mode;
+	uint32_t addr_format;
+	uint32_t _pad_top;
 
 	uint32_t src_addrlen;                     /* struct uet_addr, verbatim */
 	uint32_t dest_addrlen;
@@ -195,19 +198,70 @@ struct shim_fi_info {
 	uint64_t domain_mr_key_size;
 	uint32_t domain_auth_key_size;
 	uint8_t  domain_auth_key[SHIM_AUTH_KEY_MAX];
+	/*
+	 * The REST of domain_attr. None of it is read by the stack, which is
+	 * why ABI 3 and earlier omitted it - the field set was derived by
+	 * grepping uet_api.c for "info->". But the provider and the NCCL
+	 * plugin above it read these, and a zero is a meaningful WRONG answer:
+	 * cq_data_size == 0 made aws-ofi-nccl reject its RDMA protocol with
+	 * "Provider does not support 4 bytes of immediate data" and then fail
+	 * initialisation outright.
+	 *
+	 * So the whole scalar surface crosses now, read by us or not.
+	 */
+	uint64_t domain_caps;
+	uint64_t domain_mode;
+	uint64_t domain_cq_data_size;
+	uint64_t domain_cq_cnt;
+	uint64_t domain_ep_cnt;
+	uint64_t domain_tx_ctx_cnt;
+	uint64_t domain_rx_ctx_cnt;
+	uint64_t domain_max_ep_tx_ctx;
+	uint64_t domain_max_ep_rx_ctx;
+	uint64_t domain_cntr_cnt;
+	uint64_t domain_mr_iov_limit;
+	uint64_t domain_max_err_data;
+	uint32_t domain_threading;
+	uint32_t domain_control_progress;
+	uint32_t domain_data_progress;
+	uint32_t domain_resource_mgmt;
+	uint32_t domain_av_type;
+	uint32_t domain_tclass;
 
 	uint64_t ep_max_msg_size;                 /* ep_attr */
 	uint32_t ep_auth_key_size;
 	uint8_t  ep_auth_key[SHIM_AUTH_KEY_MAX];
+	uint32_t ep_type;                 /* enum fi_ep_type */
+	uint32_t ep_protocol;
+	uint32_t ep_protocol_version;
+	uint32_t ep_tx_ctx_cnt;
+	uint32_t ep_rx_ctx_cnt;
+	uint32_t _pad_ep;
+	uint64_t ep_msg_prefix_size;
+	uint64_t ep_max_order_raw_size;
+	uint64_t ep_max_order_war_size;
+	uint64_t ep_max_order_waw_size;
+	uint64_t ep_mem_tag_format;
 
 	uint64_t tx_size;                         /* tx_attr */
 	uint64_t tx_iov_limit;
 	uint64_t tx_rma_iov_limit;
 	uint64_t tx_msg_order;        /* & UET_ORDERING selects ROD over RUD */
 	uint32_t tx_tclass;
+	uint32_t _pad_tx;
+	uint64_t tx_caps;
+	uint64_t tx_mode;
+	uint64_t tx_op_flags;
+	uint64_t tx_comp_order;
+	uint64_t tx_inject_size;
 
 	uint64_t rx_size;                         /* rx_attr */
 	uint64_t rx_iov_limit;
+	uint64_t rx_caps;
+	uint64_t rx_mode;
+	uint64_t rx_op_flags;
+	uint64_t rx_comp_order;
+	uint64_t rx_total_buffered_recv;
 
 	/*
 	 * info->nic. The PROVIDER only ever tests this for NULL, which is why
