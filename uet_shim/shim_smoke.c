@@ -270,7 +270,17 @@ int main(int argc, char **argv)
 
 	STEP(++step, "uet_send() 256 bytes");
 	memset(buf, 0xA5, sizeof(buf));
-	rc = (int)uet_send(ep, 0, buf, 256, mr, peer, (void *)0xBEEF);
+	/* The job id must be UET_DEF_JOB_ID, not 0. uet_endpoint() in the
+	 * fabric build derives the endpoint's identity from info->src_addr and
+	 * ends with "*job_id = UET_DEF_JOB_ID", so both endpoints are job 1.
+	 * The peer address carries UET_ADDR_RELATIVE_MODE, and a relative
+	 * endpoint demuxes by job id: "if (!uet_ep->absolute &&
+	 * (uet_ep->job_id != job_id))" rejects the packet with
+	 * UET_RC_BAD_JOB_ID. Sending 0 produced "RX: Bad Job ID" on the peer
+	 * and "Msg Rsp: Bad Job ID" back here. uet.c uses UET_DEF_JOB_ID too.
+	 */
+	rc = (int)uet_send(ep, UET_DEF_JOB_ID, buf, 256, mr, peer,
+			   (void *)0xBEEF);
 	CHECK(rc, "uet_send");
 
 	STEP(++step, "uet_cq_read() poll");
