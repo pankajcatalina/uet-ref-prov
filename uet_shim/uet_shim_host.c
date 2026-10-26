@@ -434,6 +434,13 @@ struct ctx_ent {
 	int      a_owned;        /* transient: free it on completion      */
 	struct iovec *rx_iov;    /* vectored receive: where to scatter to  */
 	size_t   rx_iov_n;
+	/* A fetch or compare atomic has a SECOND local buffer - the result -
+	 * which is written by the stack and must come back. One slot is not
+	 * enough for an operation with both an operand and a result. */
+	uint64_t b_off;
+	int      b_owned;
+	void    *b_user;
+	size_t   b_len;
 };
 
 static struct ctx_ent ctx_tbl[CTX_MAX];
@@ -471,6 +478,19 @@ static void ctx_attach(uint64_t id, const struct stage *st)
 	pthread_mutex_lock(&ctx_lock);
 	ctx_tbl[id].a_off = st->off;
 	ctx_tbl[id].a_owned = st->owned;
+	pthread_mutex_unlock(&ctx_lock);
+}
+
+static void ctx_attach_b(uint64_t id, const struct stage *st,
+			 void *user, size_t len)
+{
+	if ((id == 0) || (id >= CTX_MAX))
+		return;
+	pthread_mutex_lock(&ctx_lock);
+	ctx_tbl[id].b_off = st->off;
+	ctx_tbl[id].b_owned = st->owned;
+	ctx_tbl[id].b_user = user;
+	ctx_tbl[id].b_len = len;
 	pthread_mutex_unlock(&ctx_lock);
 }
 
@@ -924,11 +944,21 @@ ssize_t uet_cq_read(uet_cq_handle_t cq_handle, void *buf, size_t count)
 				memcpy(ce.rx_buf, src, take);
 		}
 
+		/* an atomic's result buffer, written by the stack */
+		if ((ce.b_user != NULL) && (ce.b_len > 0)) {
+			void *src = shim_arena_ptr(ce.b_off, ce.b_len);
+
+			if (src != NULL)
+				memcpy(ce.b_user, src, ce.b_len);
+		}
+
 		/* A transient block lives exactly as long as its operation.
 		 * This is the line that makes the ABI 1 send-buffer hazard
 		 * structurally impossible: nothing is reused mid-flight. */
 		if (ce.a_owned)
 			shim_arena_free(ce.a_off);
+		if (ce.b_owned)
+			shim_arena_free(ce.b_off);
 	}
 
 	/* A completion is the first moment the application may look at a
@@ -1184,3 +1214,536 @@ ssize_t uet_trecvv(uet_ep_handle_t ep_handle, uint32_t job_id,
  *    gap that is a CORRECTNESS issue, not just performance.
  * ===================================================================
  */
+
+/* ===================================================================
+ * ABI 2 additions
+ *
+ * The provider imports none of these - its 25 symbols are unchanged. They
+ * exist so that uet.c, the stack's OWN test program, can be linked against
+ * this library and run its whole suite through the shim. That buys 100
+ * iterations per mode with built-in payload validation, against a native
+ * baseline from the identical binary, instead of a test I wrote myself.
+ * =================================================================== */
+
+ssize_t uet_recvv(uet_ep_handle_t ep_handle, uint32_t job_id,
+		  const struct iovec *iov, size_t iov_count,
+		  uet_mr_handle_t mr_handle,
+		  uet_addr_handle_t src_addr_handle, void *context)
+{
+	struct shim_hdr h = {
+		.h1 = shim_p2h(ep_handle),
+		.h2 = shim_p2h(mr_handle),
+		.a1 = job_id,
+		.a2 = iov_count,
+		.a3 = shim_p2h(src_addr_handle),
+	};
+	struct shim_iov tbl[SHIM_MAX_IOV];
+	struct iovec *keep;
+	struct stage st;
+	int rc;
+
+	rc = stage_iov(iov, iov_count, tbl, &st, 0);
+	if (rc != 0)
+		return rc;
+
+	keep = iov_dup(iov, iov_count);
+	if (keep == NULL) {
+		shim_arena_free(st.off);
+		return -FI_ENOMEM;
+	}
+
+	h.a4 = ctx_get(context, NULL, 0);
+	if (h.a4 == 0) {
+		shim_arena_free(st.off);
+		free(keep);
+		return -FI_EAGAIN;
+	}
+	h.off = st.off;
+	ctx_attach(h.a4, &st);
+	ctx_attach_iov(h.a4, keep, iov_count);
+
+	return (ssize_t)shim_rpc(SHIM_RECVV, &h, tbl,
+				 (uint32_t)(iov_count * sizeof(tbl[0])),
+				 NULL, 0, NULL);
+}
+
+ssize_t uet_tsend(uet_ep_handle_t ep_handle, uint32_t job_id,
+		  void *buf, size_t len, uet_mr_handle_t mr_handle,
+		  uet_addr_handle_t dst_addr_handle, uint64_t tag,
+		  void *context)
+{
+	struct shim_hdr h = {
+		.h1 = shim_p2h(ep_handle),
+		.h2 = shim_p2h(mr_handle),
+		.a1 = job_id,
+		.a2 = len,
+		.a3 = shim_p2h(dst_addr_handle),
+	};
+	struct shim_tag_args ta = { .tag = tag, .ignore = 0 };
+	struct stage st;
+	int rc;
+
+	rc = stage_tx(buf, len, &st);
+	if (rc != 0)
+		return rc;
+
+	h.a4 = ctx_get(context, NULL, 0);
+	if (h.a4 == 0) {
+		if (st.owned)
+			shim_arena_free(st.off);
+		return -FI_EAGAIN;
+	}
+	h.off = st.off;
+	ctx_attach(h.a4, &st);
+
+	return (ssize_t)shim_rpc(SHIM_TSEND, &h, &ta, sizeof(ta),
+				 NULL, 0, NULL);
+}
+
+ssize_t uet_trecv(uet_ep_handle_t ep_handle, uint32_t job_id,
+		  void *buf, size_t len, uet_mr_handle_t mr_handle,
+		  uet_addr_handle_t src_addr_handle, uint64_t tag,
+		  uint64_t ignore, void *context)
+{
+	struct shim_hdr h = {
+		.h1 = shim_p2h(ep_handle),
+		.h2 = shim_p2h(mr_handle),
+		.a1 = job_id,
+		.a2 = len,
+		.a3 = shim_p2h(src_addr_handle),
+	};
+	struct shim_tag_args ta = { .tag = tag, .ignore = ignore };
+	struct stage st;
+	int rc;
+
+	rc = stage_rx(buf, len, &st);
+	if (rc != 0)
+		return rc;
+
+	h.a4 = ctx_get(context, buf, len);
+	if (h.a4 == 0) {
+		if (st.owned)
+			shim_arena_free(st.off);
+		return -FI_EAGAIN;
+	}
+	h.off = st.off;
+	ctx_attach(h.a4, &st);
+
+	return (ssize_t)shim_rpc(SHIM_TRECV, &h, &ta, sizeof(ta),
+				 NULL, 0, NULL);
+}
+
+int uet_cq_close(uet_cq_handle_t cq_handle)
+{
+	struct shim_hdr h = { .h1 = shim_p2h(cq_handle) };
+
+	return (int)shim_rpc(SHIM_CQ_CLOSE, &h, NULL, 0, NULL, 0, NULL);
+}
+
+/*
+ * Registering a scatter list.
+ *
+ * Only contiguous segments are supported, and that is checked rather than
+ * assumed. uet.c reaches this path through UET_MR_IOV=<n>, which splits ONE
+ * buffer into n slices - so contiguity holds there. A genuinely scattered
+ * list would need one arena block per segment and an mr_ent that can hold
+ * them all; refusing is better than registering something subtly wrong.
+ */
+int uet_mr_regv(uet_domain_handle_t domain_handle, const struct iovec *iov,
+		size_t iov_count, uint64_t access, uint64_t requested_key,
+		uint64_t flags, void *context, uet_mr_handle_t *mr_handle)
+{
+	size_t i;
+	const char *base;
+
+	if ((iov_count == 0) || (iov == NULL))
+		return -FI_EINVAL;
+
+	base = iov[0].iov_base;
+	for (i = 1; i < iov_count; i++) {
+		const char *want = base;
+		size_t j;
+
+		for (j = 0; j < i; j++)
+			want += iov[j].iov_len;
+
+		if (iov[i].iov_base != want) {
+			fprintf(stderr, "[shim/host] mr_regv: segment %zu is "
+					"not contiguous with the previous "
+					"one; only contiguous lists are "
+					"supported\n", i);
+			return -FI_ENOSYS;
+		}
+	}
+
+	return uet_mr_reg(domain_handle, base, iov_total(iov, iov_count),
+			  access, requested_key, flags, context, mr_handle);
+}
+
+int uet_mr_reg_pbl(uet_domain_handle_t domain_handle, uet_dma_addr_t pbl_root,
+		   uint32_t page_size, uet_pbl_level_t level,
+		   uint32_t page_offset, uint64_t base_va, size_t len,
+		   uint64_t access, uint64_t requested_key, uint64_t flags,
+		   void *context, uet_mr_handle_t *mr_handle)
+{
+	(void)domain_handle; (void)pbl_root; (void)page_size; (void)level;
+	(void)page_offset; (void)base_va; (void)len; (void)access;
+	(void)requested_key; (void)flags; (void)context; (void)mr_handle;
+
+	/*
+	 * Not implementable across this boundary, as opposed to merely not
+	 * implemented yet: pbl_root is a DMA address describing pages pinned
+	 * in THIS address space, and nothing in the guest can resolve it.
+	 * uet.c only takes this path when UET_MR_PBL is set.
+	 */
+	fprintf(stderr, "[shim/host] mr_reg_pbl: a page buffer list is a DMA "
+			"address and cannot cross into the guest; unset "
+			"UET_MR_PBL\n");
+	return -FI_ENOSYS;
+}
+
+/*
+ * Atomics count ELEMENTS, not bytes, so staging needs the element size.
+ * Conflating the two would be a silent factor-of-eight corruption rather
+ * than an error, which is why this is spelled out instead of assumed.
+ */
+static size_t fi_dt_size(enum fi_datatype dt)
+{
+	switch (dt) {
+	case FI_INT8:
+	case FI_UINT8:        return 1;
+	case FI_INT16:
+	case FI_UINT16:       return 2;
+	case FI_INT32:
+	case FI_UINT32:
+	case FI_FLOAT:        return 4;
+	case FI_INT64:
+	case FI_UINT64:
+	case FI_DOUBLE:       return 8;
+	case FI_FLOAT_COMPLEX:  return 8;
+	case FI_DOUBLE_COMPLEX: return 16;
+	case FI_LONG_DOUBLE:    return sizeof(long double);
+	default:              return 0;      /* caller turns this into EINVAL */
+	}
+}
+
+/* write, write_sync and read differ only in opcode and in which direction
+ * the local buffer moves, so they share one body. */
+static ssize_t rma_common(uint32_t op, uet_ep_handle_t ep_handle,
+			  uint32_t job_id, void *buf, size_t len,
+			  uint64_t *data, uet_mr_handle_t mr_handle,
+			  uet_addr_handle_t dst_addr_handle,
+			  uint64_t remote_mem_addr, uint64_t remote_key,
+			  void *context, int is_read)
+{
+	struct shim_hdr h = {
+		.h1 = shim_p2h(ep_handle),
+		.h2 = shim_p2h(mr_handle),
+		.a1 = job_id,
+		.a2 = len,
+		.a3 = shim_p2h(dst_addr_handle),
+	};
+	struct shim_rma_args ra = {
+		.remote_addr = remote_mem_addr,
+		.remote_key  = remote_key,
+		.len         = len,
+		.imm_data    = (data != NULL) ? *data : 0,
+		.has_imm     = (data != NULL) ? 1u : 0u,
+		.seg_count   = 0,
+	};
+	struct stage st;
+	int rc;
+
+	/* a read FILLS the local buffer, a write DRAINS it */
+	rc = is_read ? stage_rx(buf, len, &st) : stage_tx(buf, len, &st);
+	if (rc != 0)
+		return rc;
+
+	h.a4 = ctx_get(context, is_read ? buf : NULL, is_read ? len : 0);
+	if (h.a4 == 0) {
+		if (st.owned)
+			shim_arena_free(st.off);
+		return -FI_EAGAIN;
+	}
+	h.off = st.off;
+	ctx_attach(h.a4, &st);
+
+	return (ssize_t)shim_rpc(op, &h, &ra, sizeof(ra), NULL, 0, NULL);
+}
+
+ssize_t uet_write(uet_ep_handle_t ep_handle, uint32_t job_id,
+		  void *buf, size_t len, uint64_t *data,
+		  uet_mr_handle_t mr_handle,
+		  uet_addr_handle_t dst_addr_handle,
+		  uint64_t remote_mem_addr, uint64_t remote_key,
+		  void *context)
+{
+	return rma_common(SHIM_WRITE, ep_handle, job_id, buf, len, data,
+			  mr_handle, dst_addr_handle, remote_mem_addr,
+			  remote_key, context, 0);
+}
+
+ssize_t uet_write_sync(uet_ep_handle_t ep_handle, uint32_t job_id,
+		       void *buf, size_t len, uint64_t *data,
+		       uet_mr_handle_t mr_handle,
+		       uet_addr_handle_t dst_addr_handle,
+		       uint64_t remote_mem_addr, uint64_t remote_key,
+		       void *context)
+{
+	return rma_common(SHIM_WRITE_SYNC, ep_handle, job_id, buf, len, data,
+			  mr_handle, dst_addr_handle, remote_mem_addr,
+			  remote_key, context, 0);
+}
+
+ssize_t uet_read(uet_ep_handle_t ep_handle, uint32_t job_id, void *buf,
+		 size_t len, uet_mr_handle_t mr_handle,
+		 uet_addr_handle_t uet_addr_handle,
+		 uint64_t remote_mem_addr, uint64_t remote_key, void *context)
+{
+	return rma_common(SHIM_READ, ep_handle, job_id, buf, len, NULL,
+			  mr_handle, uet_addr_handle, remote_mem_addr,
+			  remote_key, context, 1);
+}
+
+/*
+ * The segment forms need no staging at all: every segment already lives in
+ * a registered region, so it already has a home in the arena. Only the
+ * handles need translating, which is what struct shim_seg carries.
+ */
+static ssize_t rmaseg_common(uint32_t op, uet_ep_handle_t ep_handle,
+			     uint32_t job_id, const struct uet_mr_seg *seg,
+			     size_t seg_count, uint64_t *data,
+			     uet_addr_handle_t addr_handle,
+			     uint64_t remote_mem_addr, uint64_t remote_key,
+			     void *context)
+{
+	struct shim_hdr h = {
+		.h1 = shim_p2h(ep_handle),
+		.a1 = job_id,
+		.a2 = seg_count,
+		.a3 = shim_p2h(addr_handle),
+	};
+	struct {
+		struct shim_rma_args ra;
+		struct shim_seg      seg[SHIM_MAX_IOV];
+	} pkt;
+	size_t i, total = 0;
+
+	if ((seg_count == 0) || (seg_count > SHIM_MAX_IOV))
+		return -FI_EINVAL;
+
+	for (i = 0; i < seg_count; i++) {
+		pkt.seg[i].mr   = shim_p2h(seg[i].mr);
+		pkt.seg[i].addr = seg[i].addr;
+		pkt.seg[i].len  = seg[i].len;
+		total += seg[i].len;
+	}
+
+	pkt.ra.remote_addr = remote_mem_addr;
+	pkt.ra.remote_key  = remote_key;
+	pkt.ra.len         = total;
+	pkt.ra.imm_data    = (data != NULL) ? *data : 0;
+	pkt.ra.has_imm     = (data != NULL) ? 1u : 0u;
+	pkt.ra.seg_count   = (uint32_t)seg_count;
+
+	h.a4 = ctx_get(context, NULL, 0);
+	if (h.a4 == 0)
+		return -FI_EAGAIN;
+
+	return (ssize_t)shim_rpc(op, &h, &pkt,
+				 (uint32_t)(sizeof(pkt.ra) +
+					    seg_count * sizeof(pkt.seg[0])),
+				 NULL, 0, NULL);
+}
+
+ssize_t uet_writeseg(uet_ep_handle_t ep_handle, uint32_t job_id,
+		     const struct uet_mr_seg *seg, size_t seg_count,
+		     uint64_t *data, uet_addr_handle_t dst_addr_handle,
+		     uint64_t remote_mem_addr, uint64_t remote_key,
+		     void *context)
+{
+	return rmaseg_common(SHIM_WRITESEG, ep_handle, job_id, seg, seg_count,
+			     data, dst_addr_handle, remote_mem_addr,
+			     remote_key, context);
+}
+
+ssize_t uet_readseg(uet_ep_handle_t ep_handle, uint32_t job_id,
+		    const struct uet_mr_seg *seg, size_t seg_count,
+		    uet_addr_handle_t uet_addr_handle,
+		    uint64_t remote_mem_addr, uint64_t remote_key,
+		    void *context)
+{
+	return rmaseg_common(SHIM_READSEG, ep_handle, job_id, seg, seg_count,
+			     NULL, uet_addr_handle, remote_mem_addr,
+			     remote_key, context);
+}
+
+/*
+ * All four atomics share this. The operand always goes out; compare and
+ * result are present only for the forms that have them, and the result is
+ * the one buffer that has to come BACK, which is what ctx's second slot is
+ * for.
+ */
+static ssize_t atomic_common(uint32_t op, uet_ep_handle_t ep_handle,
+			     uint32_t job_id, const void *local_op_buf,
+			     size_t count, uet_mr_handle_t op_mr,
+			     const void *compare_buf,
+			     uet_mr_handle_t compare_mr,
+			     void *result_buf, uet_mr_handle_t result_mr,
+			     uet_addr_handle_t dst_addr_handle,
+			     uint64_t remote_mem_addr, uint64_t remote_key,
+			     enum fi_datatype datatype, enum fi_op atomic_op,
+			     void *context)
+{
+	struct shim_hdr h = {
+		.h1 = shim_p2h(ep_handle),
+		.a1 = job_id,
+		.a2 = count,
+		.a3 = shim_p2h(dst_addr_handle),
+	};
+	struct shim_atomic_args aa = {
+		.remote_addr = remote_mem_addr,
+		.remote_key  = remote_key,
+		.count       = count,
+		.op_mr       = shim_p2h(op_mr),
+		.cmp_mr      = shim_p2h(compare_mr),
+		.res_mr      = shim_p2h(result_mr),
+		.datatype    = (uint32_t)datatype,
+		.atomic_op   = (uint32_t)atomic_op,
+	};
+	struct stage op_st = { 0 }, cmp_st = { 0 }, res_st = { 0 };
+	size_t esz = fi_dt_size(datatype);
+	size_t bytes;
+	int rc;
+
+	if ((esz == 0) || (count == 0))
+		return -FI_EINVAL;
+	bytes = count * esz;
+
+	rc = stage_tx(local_op_buf, bytes, &op_st);
+	if (rc != 0)
+		return rc;
+	rc = stage_tx(compare_buf, bytes, &cmp_st);
+	if (rc != 0)
+		goto err_op;
+	rc = stage_rx(result_buf, bytes, &res_st);
+	if (rc != 0)
+		goto err_cmp;
+
+	aa.bytes   = bytes;
+	aa.op_off  = op_st.off;
+	aa.cmp_off = cmp_st.off;
+	aa.res_off = res_st.off;
+
+	h.a4 = ctx_get(context, NULL, 0);
+	if (h.a4 == 0) {
+		rc = -FI_EAGAIN;
+		goto err_res;
+	}
+	h.off = op_st.off;
+	ctx_attach(h.a4, &op_st);
+	ctx_attach_b(h.a4, &res_st, result_buf, result_buf ? bytes : 0);
+	/* the compare operand is read-only and short-lived; it has no slot,
+	 * so it is released as soon as the call returns rather than at
+	 * completion. The stack has copied it into the request by then. */
+
+	{
+		ssize_t ret = (ssize_t)shim_rpc(op, &h, &aa, sizeof(aa),
+						NULL, 0, NULL);
+
+		if (cmp_st.owned)
+			shim_arena_free(cmp_st.off);
+		return ret;
+	}
+
+err_res:
+	if (res_st.owned)
+		shim_arena_free(res_st.off);
+err_cmp:
+	if (cmp_st.owned)
+		shim_arena_free(cmp_st.off);
+err_op:
+	if (op_st.owned)
+		shim_arena_free(op_st.off);
+	return rc;
+}
+
+ssize_t uet_atomic(uet_ep_handle_t ep_handle, uint32_t job_id,
+		   const void *local_op_buf, size_t count,
+		   uet_mr_handle_t mr_handle,
+		   uet_addr_handle_t dst_addr_handle,
+		   uint64_t remote_mem_addr, uint64_t remote_key,
+		   enum fi_datatype datatype, enum fi_op op, void *context)
+{
+	return atomic_common(SHIM_ATOMIC, ep_handle, job_id, local_op_buf,
+			     count, mr_handle, NULL, NULL, NULL, NULL,
+			     dst_addr_handle, remote_mem_addr, remote_key,
+			     datatype, op, context);
+}
+
+ssize_t uet_atomic_sync(uet_ep_handle_t ep_handle, uint32_t job_id,
+			const void *local_op_buf, size_t count,
+			uet_mr_handle_t mr_handle,
+			uet_addr_handle_t dst_addr_handle,
+			uint64_t remote_mem_addr, uint64_t remote_key,
+			enum fi_datatype datatype, enum fi_op op,
+			void *context)
+{
+	return atomic_common(SHIM_ATOMIC_SYNC, ep_handle, job_id,
+			     local_op_buf, count, mr_handle, NULL, NULL,
+			     NULL, NULL, dst_addr_handle, remote_mem_addr,
+			     remote_key, datatype, op, context);
+}
+
+ssize_t uet_fetch_atomic(uet_ep_handle_t ep_handle, uint32_t job_id,
+			 const void *local_op_buf, size_t count,
+			 uet_mr_handle_t op_mr_handle, void *result_buf,
+			 uet_mr_handle_t result_mr_handle,
+			 uet_addr_handle_t dst_addr_handle,
+			 uint64_t remote_mem_addr, uint64_t remote_key,
+			 enum fi_datatype datatype, enum fi_op op,
+			 void *context)
+{
+	return atomic_common(SHIM_FETCH_ATOMIC, ep_handle, job_id,
+			     local_op_buf, count, op_mr_handle, NULL, NULL,
+			     result_buf, result_mr_handle, dst_addr_handle,
+			     remote_mem_addr, remote_key, datatype, op,
+			     context);
+}
+
+ssize_t uet_compare_atomic(uet_ep_handle_t ep_handle, uint32_t job_id,
+			   const void *local_op_buf, size_t count,
+			   uet_mr_handle_t op_mr_handle,
+			   const void *compare_buf,
+			   uet_mr_handle_t compare_mr_handle,
+			   void *result_buf,
+			   uet_mr_handle_t result_mr_handle,
+			   uet_addr_handle_t dst_addr_handle,
+			   uint64_t remote_mem_addr, uint64_t remote_key,
+			   enum fi_datatype datatype, enum fi_op op,
+			   void *context)
+{
+	return atomic_common(SHIM_COMPARE_ATOMIC, ep_handle, job_id,
+			     local_op_buf, count, op_mr_handle, compare_buf,
+			     compare_mr_handle, result_buf,
+			     result_mr_handle, dst_addr_handle,
+			     remote_mem_addr, remote_key, datatype, op,
+			     context);
+}
+
+int uet_query_atomic(uet_domain_handle_t domain_handle,
+		     enum fi_datatype datatype, enum fi_op op,
+		     struct fi_atomic_attr *attr, uint64_t flags)
+{
+	struct shim_hdr h = {
+		.h1 = shim_p2h(domain_handle),
+		.a1 = (uint64_t)datatype,
+		.a2 = (uint64_t)op,
+		.a3 = flags,
+	};
+	uint32_t rlen = 0;
+	int64_t rc = shim_rpc(SHIM_QUERY_ATOMIC, &h, NULL, 0, attr,
+			      (attr != NULL) ? sizeof(*attr) : 0, &rlen);
+
+	return (int)rc;
+}

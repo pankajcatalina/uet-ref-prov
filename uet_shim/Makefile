@@ -5,6 +5,7 @@
 #   make host         uet_shim_host.o + friends, for the container
 #   make guest        uet_shim_guest, for the VM
 #   make shim_smoke   drives the shim as uet_provider does
+#   make uet_via_shim uet.c's whole suite, driven through the shim
 #   make host-pkg     self-contained container package (no stack sources)
 #
 # transport: shm (shared memory, ~0.4 us) or vsock (~30 us, no ivshmem).
@@ -101,6 +102,24 @@ libuet_shim_host.so: $(PICOBJ)
 %.pic.o: %.c uet_shim.h uet_shim_info.h uet_shim_arena.h
 	$(CC) $(CFLAGS) -fPIC -c $< -o $@
 
+# ---- uet.c, the stack's OWN test program, driven through the shim ----
+# Links libuet_shim_host.so INSTEAD of libuet_fabric.so, so uet.c's entire
+# suite - tagged, RMA, atomics, unexpected messages, deferred sends, 100
+# iterations each with built-in payload validation - runs against the stack
+# inside the guest, and can be diffed against a native baseline produced by
+# the identical binary.
+#
+# Built here and not in host-pkg: host-pkg is the minimal production package
+# for the container, and this is a test harness. It needs the uet tree for
+# uet.c itself, so it is unavailable in an isolated build - by design.
+uet_via_shim: $(UETDIR)/uet.c uet_shim_testhelp.o libuet_shim_host.so
+	$(CC) $(CFLAGS) $(UETDIR)/uet.c uet_shim_testhelp.o -o $@ \
+	      -L. -luet_shim_host $(LDLIBS) \
+	      -Wl,-rpath,$(abspath .) $(RPATH_LF)
+
+uet_shim_testhelp.o: uet_shim_testhelp.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 shim_smoke: shim_smoke.c uet_shim_host.o $(COMMON)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS) $(RPATH_LF)
 
@@ -135,7 +154,7 @@ host-pkg:
 
 clean:
 	rm -f *.o *.pic.o libuet_shim_host.so uet_shim_guest xport_test \
-	      shim_smoke arena_test
+	      shim_smoke arena_test uet_via_shim
 	rm -rf host-pkg
 
 .PHONY: all host guest clean host-pkg

@@ -589,6 +589,257 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		break;
 	}
 
+	/* ------------------------------------------- ABI 2: messaging */
+	case SHIM_RECVV: {
+		struct shim_iov *tbl = (struct shim_iov *)g_in;
+		struct iovec iov[SHIM_MAX_IOV];
+		size_t cnt = req->a2, i;
+
+		if (cnt > SHIM_MAX_IOV) {
+			rsp->ret = -EINVAL;
+			break;
+		}
+		for (i = 0; i < cnt; i++) {
+			iov[i].iov_base = arena_in(req->off + tbl[i].off,
+						   tbl[i].len, &rsp->ret);
+			if (iov[i].iov_base == NULL)
+				break;
+			iov[i].iov_len = tbl[i].len;
+		}
+		if (i != cnt)
+			break;
+		rsp->ret = uet_recvv(hdl_get(req->h1), (uint32_t)req->a1,
+				     iov, cnt, hdl_get(req->h2),
+				     hdl_get(req->a3),
+				     (void *)(uintptr_t)req->a4);
+		break;
+	}
+
+	case SHIM_TSEND: {
+		struct shim_tag_args *ta = (struct shim_tag_args *)g_in;
+		void *buf;
+
+		if (req->payload_len < sizeof(*ta)) {
+			rsp->ret = -EINVAL;
+			break;
+		}
+		buf = arena_in(req->off, req->a2, &rsp->ret);
+		if (buf == NULL)
+			break;
+		rsp->ret = uet_tsend(hdl_get(req->h1), (uint32_t)req->a1,
+				     buf, req->a2, hdl_get(req->h2),
+				     hdl_get(req->a3), ta->tag,
+				     (void *)(uintptr_t)req->a4);
+		break;
+	}
+
+	case SHIM_TRECV: {
+		struct shim_tag_args *ta = (struct shim_tag_args *)g_in;
+		void *buf;
+
+		if (req->payload_len < sizeof(*ta)) {
+			rsp->ret = -EINVAL;
+			break;
+		}
+		buf = arena_in(req->off, req->a2, &rsp->ret);
+		if (buf == NULL)
+			break;
+		rsp->ret = uet_trecv(hdl_get(req->h1), (uint32_t)req->a1,
+				     buf, req->a2, hdl_get(req->h2),
+				     hdl_get(req->a3), ta->tag, ta->ignore,
+				     (void *)(uintptr_t)req->a4);
+		break;
+	}
+
+	case SHIM_CQ_CLOSE:
+		rsp->ret = uet_cq_close(hdl_get(req->h1));
+		hdl_del(req->h1);
+		break;
+
+	/* ------------------------------------------------- ABI 2: RMA
+	 * The host turns uet_mr_regv() into a plain MR_REG and answers
+	 * MR_REG_PBL itself with -ENOSYS, so neither opcode arrives here.
+	 * They are declared so the protocol has room for them, and the
+	 * default case below answers correctly if one ever shows up.
+	 */
+	case SHIM_WRITE:
+	case SHIM_WRITE_SYNC:
+	case SHIM_READ: {
+		struct shim_rma_args *ra = (struct shim_rma_args *)g_in;
+		uint64_t imm;
+		void *buf;
+
+		if (req->payload_len < sizeof(*ra)) {
+			rsp->ret = -EINVAL;
+			break;
+		}
+		buf = arena_in(req->off, ra->len, &rsp->ret);
+		if (buf == NULL)
+			break;
+
+		imm = ra->imm_data;
+		if (req->op == SHIM_READ)
+			rsp->ret = uet_read(hdl_get(req->h1),
+					    (uint32_t)req->a1, buf, ra->len,
+					    hdl_get(req->h2),
+					    hdl_get(req->a3),
+					    ra->remote_addr, ra->remote_key,
+					    (void *)(uintptr_t)req->a4);
+		else if (req->op == SHIM_WRITE)
+			rsp->ret = uet_write(hdl_get(req->h1),
+					     (uint32_t)req->a1, buf, ra->len,
+					     ra->has_imm ? &imm : NULL,
+					     hdl_get(req->h2),
+					     hdl_get(req->a3),
+					     ra->remote_addr, ra->remote_key,
+					     (void *)(uintptr_t)req->a4);
+		else
+			rsp->ret = uet_write_sync(hdl_get(req->h1),
+						  (uint32_t)req->a1, buf,
+						  ra->len,
+						  ra->has_imm ? &imm : NULL,
+						  hdl_get(req->h2),
+						  hdl_get(req->a3),
+						  ra->remote_addr,
+						  ra->remote_key,
+						  (void *)(uintptr_t)req->a4);
+		break;
+	}
+
+	case SHIM_WRITESEG:
+	case SHIM_READSEG: {
+		struct shim_rma_args *ra = (struct shim_rma_args *)g_in;
+		struct shim_seg *in_seg =
+			(struct shim_seg *)(g_in + sizeof(*ra));
+		struct uet_mr_seg seg[SHIM_MAX_IOV];
+		size_t cnt, i;
+		uint64_t imm;
+
+		if (req->payload_len < sizeof(*ra)) {
+			rsp->ret = -EINVAL;
+			break;
+		}
+		cnt = ra->seg_count;
+		if ((cnt == 0) || (cnt > SHIM_MAX_IOV) ||
+		    (req->payload_len <
+		     (sizeof(*ra) + cnt * sizeof(*in_seg)))) {
+			rsp->ret = -EINVAL;
+			break;
+		}
+		/* each segment already lives in a registered region, so only
+		 * the HANDLE needs translating - the address is an offset
+		 * within that region and means the same on both sides */
+		for (i = 0; i < cnt; i++) {
+			seg[i].mr = hdl_get(in_seg[i].mr);
+			seg[i].addr = in_seg[i].addr;
+			seg[i].len = in_seg[i].len;
+		}
+
+		imm = ra->imm_data;
+		if (req->op == SHIM_WRITESEG)
+			rsp->ret = uet_writeseg(hdl_get(req->h1),
+						(uint32_t)req->a1, seg, cnt,
+						ra->has_imm ? &imm : NULL,
+						hdl_get(req->a3),
+						ra->remote_addr,
+						ra->remote_key,
+						(void *)(uintptr_t)req->a4);
+		else
+			rsp->ret = uet_readseg(hdl_get(req->h1),
+					       (uint32_t)req->a1, seg, cnt,
+					       hdl_get(req->a3),
+					       ra->remote_addr, ra->remote_key,
+					       (void *)(uintptr_t)req->a4);
+		break;
+	}
+
+	/* --------------------------------------------- ABI 2: atomics */
+	case SHIM_ATOMIC:
+	case SHIM_ATOMIC_SYNC:
+	case SHIM_FETCH_ATOMIC:
+	case SHIM_COMPARE_ATOMIC: {
+		struct shim_atomic_args *aa =
+			(struct shim_atomic_args *)g_in;
+		void *op_buf, *cmp_buf = NULL, *res_buf = NULL;
+
+		if (req->payload_len < sizeof(*aa)) {
+			rsp->ret = -EINVAL;
+			break;
+		}
+		op_buf = arena_in(aa->op_off, aa->bytes, &rsp->ret);
+		if (op_buf == NULL)
+			break;
+		if (aa->cmp_off != 0) {
+			cmp_buf = arena_in(aa->cmp_off, aa->bytes, &rsp->ret);
+			if (cmp_buf == NULL)
+				break;
+		}
+		if (aa->res_off != 0) {
+			res_buf = arena_in(aa->res_off, aa->bytes, &rsp->ret);
+			if (res_buf == NULL)
+				break;
+		}
+
+		switch (req->op) {
+		case SHIM_ATOMIC:
+			rsp->ret = uet_atomic(hdl_get(req->h1),
+					      (uint32_t)req->a1, op_buf,
+					      aa->count, hdl_get(aa->op_mr),
+					      hdl_get(req->a3),
+					      aa->remote_addr, aa->remote_key,
+					      (enum fi_datatype)aa->datatype,
+					      (enum fi_op)aa->atomic_op,
+					      (void *)(uintptr_t)req->a4);
+			break;
+		case SHIM_ATOMIC_SYNC:
+			rsp->ret = uet_atomic_sync(hdl_get(req->h1),
+					      (uint32_t)req->a1, op_buf,
+					      aa->count, hdl_get(aa->op_mr),
+					      hdl_get(req->a3),
+					      aa->remote_addr, aa->remote_key,
+					      (enum fi_datatype)aa->datatype,
+					      (enum fi_op)aa->atomic_op,
+					      (void *)(uintptr_t)req->a4);
+			break;
+		case SHIM_FETCH_ATOMIC:
+			rsp->ret = uet_fetch_atomic(hdl_get(req->h1),
+					      (uint32_t)req->a1, op_buf,
+					      aa->count, hdl_get(aa->op_mr),
+					      res_buf, hdl_get(aa->res_mr),
+					      hdl_get(req->a3),
+					      aa->remote_addr, aa->remote_key,
+					      (enum fi_datatype)aa->datatype,
+					      (enum fi_op)aa->atomic_op,
+					      (void *)(uintptr_t)req->a4);
+			break;
+		default:
+			rsp->ret = uet_compare_atomic(hdl_get(req->h1),
+					      (uint32_t)req->a1, op_buf,
+					      aa->count, hdl_get(aa->op_mr),
+					      cmp_buf, hdl_get(aa->cmp_mr),
+					      res_buf, hdl_get(aa->res_mr),
+					      hdl_get(req->a3),
+					      aa->remote_addr, aa->remote_key,
+					      (enum fi_datatype)aa->datatype,
+					      (enum fi_op)aa->atomic_op,
+					      (void *)(uintptr_t)req->a4);
+			break;
+		}
+		break;
+	}
+
+	case SHIM_QUERY_ATOMIC: {
+		struct fi_atomic_attr *attr = (struct fi_atomic_attr *)g_out;
+
+		memset(attr, 0, sizeof(*attr));
+		rsp->ret = uet_query_atomic(hdl_get(req->h1),
+					    (enum fi_datatype)req->a1,
+					    (enum fi_op)req->a2, attr,
+					    req->a3);
+		rsp->payload_len = sizeof(*attr);
+		break;
+	}
+
 	default:
 		/* reject rather than fall through: an opcode we do not know
 		 * means the peer was built from a different header */

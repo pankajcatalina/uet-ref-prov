@@ -229,21 +229,49 @@ struct shim_rma_args {
 	uint64_t remote_addr;
 	uint64_t remote_key;
 	uint64_t len;
-	uint64_t seg_off;        /* writeseg/readseg only; 0 otherwise */
+	uint64_t imm_data;       /* the value of uet_write()'s uint64_t *data */
+	uint32_t has_imm;        /* that pointer may legitimately be NULL, and
+				  * NULL is not a value we can send, so the
+				  * presence travels separately               */
+	uint32_t seg_count;      /* writeseg/readseg: shim_seg[] follows */
 };
 
+/*
+ * One segment of a scatter list that is already registered. uet_mr_seg's
+ * addr is "an offset from zero when base_va is 0", and every region the
+ * shim registers has base_va 0 - so the address needs no translation and
+ * crosses as-is. The handle does: it is an id here and a pointer there.
+ */
+struct shim_seg {
+	shim_handle_t mr;
+	uint64_t      addr;
+	uint64_t      len;
+};
+
+/*
+ * Atomics carry up to three buffers (operand, compare, result), each with
+ * its own region, which is why none of this fits in the header.
+ */
 struct shim_atomic_args {
-	uint64_t remote_addr;
-	uint64_t remote_key;
-	uint64_t len;
-	uint64_t cmp_off;        /* compare_atomic: arena offset of the
-				  * compare operand, 0 otherwise         */
-	uint64_t res_off;        /* fetch/compare: arena offset of the
-				  * result buffer, 0 otherwise           */
-	uint32_t atomic_op;
-	uint32_t datatype;
-	uint32_t count;
-	uint32_t _pad;           /* keep the struct 8-byte aligned */
+	uint64_t      remote_addr;
+	uint64_t      remote_key;
+	uint64_t      count;     /* ELEMENTS, not bytes - the stack scales by
+				  * datatype, and conflating the two would be
+				  * a silent 8x corruption                   */
+	uint64_t      bytes;     /* count x sizeof(datatype). Redundant, and
+				  * deliberately so: the guest needs it to
+				  * bounds-check the arena offsets, and
+				  * sending it beats keeping a second copy of
+				  * the datatype table in sync across two
+				  * files                                    */
+	uint64_t      op_off;    /* arena offsets; 0 where unused */
+	uint64_t      cmp_off;
+	uint64_t      res_off;
+	shim_handle_t op_mr;
+	shim_handle_t cmp_mr;
+	shim_handle_t res_mr;
+	uint32_t      datatype;  /* enum fi_datatype */
+	uint32_t      atomic_op; /* enum fi_op */
 };
 
 /* --------------------------------------------------------------- messages
@@ -328,15 +356,20 @@ struct shim_hdr {
  *
  * WRITE         payload = struct shim_rma_args
  * READ          payload = struct shim_rma_args
- * WRITESEG      payload = struct shim_rma_args (uses .seg_off)
- * READSEG       payload = struct shim_rma_args (uses .seg_off)
  * WRITE_SYNC    payload = struct shim_rma_args
+ * WRITESEG      payload = shim_rma_args then seg_count x struct shim_seg;
+ *                         hdr.off unused, each segment names its own region
+ * READSEG       as WRITESEG
  * ATOMIC        payload = struct shim_atomic_args
- * FETCH_ATOMIC  payload = struct shim_atomic_args (uses .res_off)
- * COMPARE_ATOMIC payload = struct shim_atomic_args (.cmp_off + .res_off)
  * ATOMIC_SYNC   payload = struct shim_atomic_args
- * QUERY_ATOMIC  in:  h1 = uet, a1 = atomic_op, a2 = datatype, a3 = flags
- *               out: ret = 0 on supported
+ * FETCH_ATOMIC  payload = struct shim_atomic_args (uses .res_*)
+ * COMPARE_ATOMIC payload = struct shim_atomic_args (.cmp_* and .res_*)
+ * QUERY_ATOMIC  in:  h1 = domain, a1 = datatype, a2 = atomic_op, a3 = flags
+ *               out: ret, payload = struct fi_atomic_attr
+ *
+ * MR_REG_PBL is declared but returns -ENOSYS: its pbl_root is a DMA
+ * address, which is meaningless in the other address space. uet.c only
+ * takes that path when UET_MR_PBL is set.
  * EVENT_EQ      guest -> host: a1 = context id, payload = the event
  * EVENT_EQ_ERR  guest -> host: a1 = context id, payload = the event
  */
