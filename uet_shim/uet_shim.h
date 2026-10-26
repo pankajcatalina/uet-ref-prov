@@ -198,9 +198,24 @@ struct shim_fi_info {
 	uint64_t rx_size;                         /* rx_attr */
 	uint64_t rx_iov_limit;
 
-	uint8_t  has_nic;        /* info->nic != NULL; the stack only tests it */
+	/*
+	 * info->nic. The PROVIDER only ever tests this for NULL, which is why
+	 * ABI 1 carried a single byte. uet.c dereferences it all the way down
+	 * - info->nic->device_attr->name, ->link_attr->network_type, and so
+	 * on - and segfaulted on the byte. Carrying the leaf values is enough:
+	 * nothing reads any other part of a fid_nic.
+	 */
+	uint8_t  has_nic;
 	uint8_t  has_next;
 	uint8_t  _pad[2];        /* explicit, so the size is in the source */
+
+	char     nic_dev_name[SHIM_NAME_MAX];     /* device_attr->name     */
+	char     nic_net_type[SHIM_NAME_MAX];     /* link_attr->network_type */
+	char     nic_address[SHIM_NAME_MAX];      /* link_attr->address    */
+	uint64_t nic_mtu;
+	uint64_t nic_speed;
+	uint32_t nic_state;                       /* enum fi_link_state    */
+	uint32_t _pad2;
 };
 
 /* An iovec entry as offset+len: a host pointer means nothing in the guest.

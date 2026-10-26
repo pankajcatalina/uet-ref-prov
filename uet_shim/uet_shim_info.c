@@ -109,8 +109,27 @@ void shim_info_flatten(const struct fi_info *in, struct shim_fi_info *out)
 		out->rx_iov_limit = in->rx_attr->iov_limit;
 	}
 
-	/* pointers the stack only TESTS, reduced to one byte each */
-	out->has_nic  = (in->nic != NULL);
+	/*
+	 * info->nic, down to the leaves uet.c actually prints. Each level is
+	 * guarded: a provider may populate device_attr without link_attr.
+	 */
+	out->has_nic = (in->nic != NULL);
+	if (in->nic != NULL) {
+		if (in->nic->device_attr != NULL)
+			CPY_STR(out->nic_dev_name,
+				in->nic->device_attr->name);
+		if (in->nic->link_attr != NULL) {
+			CPY_STR(out->nic_net_type,
+				in->nic->link_attr->network_type);
+			CPY_STR(out->nic_address,
+				in->nic->link_attr->address);
+			out->nic_mtu   = in->nic->link_attr->mtu;
+			out->nic_speed = in->nic->link_attr->speed;
+			out->nic_state = (uint32_t)in->nic->link_attr->state;
+		}
+	}
+
+	/* a pointer the stack only TESTS, reduced to one byte */
 	out->has_next = (in->next != NULL);
 }
 
@@ -120,6 +139,67 @@ static char *dup_or_null(const char *s)
 {
 	return ((s != NULL) && (s[0] != '\0')) ? strdup(s) : NULL;
 }
+
+/*
+ * fi_freeinfo() closes info->nic only when its fid has a close op
+ * (fabric.c: "FI_CHECK_OP(info->nic->fid.ops, struct fi_ops, close)").
+ * libfabric's own ofi_nic_dup() would do all of this, but it is internal
+ * and not exported from the shared library - so the nic is hand-built and
+ * given a close op that frees exactly what was allocated. Leaving fid.ops
+ * NULL would also "work", by leaking it on every fi_freeinfo().
+ */
+static int shim_nic_close(struct fid *fid)
+{
+	struct fid_nic *nic = (struct fid_nic *)fid;
+
+	if (nic == NULL)
+		return 0;
+
+	if (nic->device_attr != NULL) {
+		free(nic->device_attr->name);
+		free(nic->device_attr);
+	}
+	if (nic->link_attr != NULL) {
+		free(nic->link_attr->network_type);
+		free(nic->link_attr->address);
+		free(nic->link_attr);
+	}
+	free(nic);
+	return 0;
+}
+
+static struct fi_ops shim_nic_fi_ops = {
+	.size  = sizeof(struct fi_ops),
+	.close = shim_nic_close,
+};
+
+static struct fid_nic *shim_nic_build(const struct shim_fi_info *in)
+{
+	struct fid_nic *nic = calloc(1, sizeof(*nic));
+
+	if (nic == NULL)
+		return NULL;
+
+	nic->fid.fclass = FI_CLASS_NIC;
+	nic->fid.ops    = &shim_nic_fi_ops;
+
+	nic->device_attr = calloc(1, sizeof(*nic->device_attr));
+	nic->link_attr   = calloc(1, sizeof(*nic->link_attr));
+	if ((nic->device_attr == NULL) || (nic->link_attr == NULL)) {
+		shim_nic_close(&nic->fid);
+		return NULL;
+	}
+
+	nic->device_attr->name       = dup_or_null(in->nic_dev_name);
+	nic->link_attr->network_type = dup_or_null(in->nic_net_type);
+	nic->link_attr->address      = dup_or_null(in->nic_address);
+	nic->link_attr->mtu          = in->nic_mtu;
+	nic->link_attr->speed        = in->nic_speed;
+	nic->link_attr->state        = (enum fi_link_state)in->nic_state;
+
+	return nic;
+}
+
 
 static void *dup_blob(const void *src, uint32_t len)
 {
@@ -181,14 +261,15 @@ struct fi_info *shim_info_build(const struct shim_fi_info *in)
 	fi->rx_attr->iov_limit = in->rx_iov_limit;
 
 	/*
-	 * info->nic is left NULL. The stack only ever tests it for NULL and
-	 * never dereferences it beyond ->fid, so has_nic reproduces the
-	 * observable behaviour exactly. If that ever changes, struct fi_nic
-	 * has to be marshalled too - and this comment is where you will
-	 * look.
+	 * info->nic, rebuilt. ABI 1 left this NULL because the provider only
+	 * tests it; uet.c dereferences it to print the device, so it has to
+	 * exist here.
 	 *
-	 * info->next is likewise left NULL: the shim presents a single
-	 * fi_info, not a list.
+	 * info->next is still left NULL: the shim presents a single fi_info,
+	 * not a list.
 	 */
+	if (in->has_nic)
+		fi->nic = shim_nic_build(in);
+
 	return fi;
 }
