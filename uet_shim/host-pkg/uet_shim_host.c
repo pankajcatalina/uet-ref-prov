@@ -453,6 +453,17 @@ static uint64_t ctx_get(void *context, void *rx_buf, size_t rx_len)
 	pthread_mutex_lock(&ctx_lock);
 	for (i = 1; i < CTX_MAX; i++) {          /* 0 means "none" */
 		if (!ctx_tbl[i].used) {
+			/*
+			 * Clear the WHOLE entry, not just the fields set
+			 * below. A recycled slot otherwise inherits the
+			 * previous operation's rx_iov and arena block, and
+			 * the next completion frees both a second time -
+			 * which showed up as "double free detected in
+			 * tcache" on a vectored receive, and as a live
+			 * arena block being handed to another operation
+			 * on the sending side.
+			 */
+			memset(&ctx_tbl[i], 0, sizeof(ctx_tbl[i]));
 			ctx_tbl[i].used = 1;
 			ctx_tbl[i].context = context;
 			ctx_tbl[i].rx_buf = rx_buf;
@@ -515,7 +526,9 @@ static struct ctx_ent ctx_take(uint64_t id)
 		return e;
 	pthread_mutex_lock(&ctx_lock);
 	e = ctx_tbl[id];
-	ctx_tbl[id].used = 0;
+	/* the caller now owns every pointer in e, so the slot must keep none
+	 * of them - clearing only .used was what let them be freed twice */
+	memset(&ctx_tbl[id], 0, sizeof(ctx_tbl[id]));
 	pthread_mutex_unlock(&ctx_lock);
 	return e;
 }
