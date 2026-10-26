@@ -61,6 +61,19 @@ static int g_verbose = 1;
 #define HDL_MAX 1024
 
 static void *hdl_tbl[HDL_MAX];
+
+/*
+ * uet_av_insert() does NOT copy the address it is given - it stores the
+ * caller's pointer (uet_api.c: "av_entry->addr = uet_addr") and dereferences
+ * it again on every send to build the IP header. g_in is the RPC staging
+ * buffer, reused by the next request that carries a payload, so passing g_in
+ * meant the first uet_send() read its own 256 bytes of 0xA5 as the
+ * destination address: the frame left with the correct MAC (resolved during
+ * the insert, while the address was still intact) but daddr 165.165.165.165,
+ * and the peer answered UET_RC_UNDELIVERABLE. Each AV entry therefore owns a
+ * stable copy, released in SHIM_AV_REMOVE.
+ */
+static struct uet_addr *av_addr[HDL_MAX];
 static uint64_t hdl_next = 1;
 
 static shim_handle_t hdl_put(void *p)
@@ -404,20 +417,38 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 	/* -------------------------------------------- address vector */
 	case SHIM_AV_INSERT: {
 		uet_addr_handle_t ah = NULL;
+		struct uet_addr *a;
 
 		if (req->payload_len < sizeof(struct uet_addr)) {
 			rsp->ret = -EINVAL;
 			break;
 		}
-		rsp->ret = uet_av_insert(hdl_get(req->h1),
-					 (struct uet_addr *)g_in, &ah);
-		if (rsp->ret == 0)
+		a = malloc(sizeof(*a));
+		if (a == NULL) {
+			rsp->ret = -ENOMEM;
+			break;
+		}
+		memcpy(a, g_in, sizeof(*a));
+
+		rsp->ret = uet_av_insert(hdl_get(req->h1), a, &ah);
+		if (rsp->ret == 0) {
 			rsp->h2 = hdl_put(ah);
+			if (rsp->h2 < HDL_MAX)
+				av_addr[rsp->h2] = a;
+			else
+				free(a);   /* table full: ah is unusable */
+		} else {
+			free(a);
+		}
 		break;
 	}
 
 	case SHIM_AV_REMOVE:
 		rsp->ret = uet_av_remove(hdl_get(req->h2));
+		if (req->h2 < HDL_MAX) {
+			free(av_addr[req->h2]);
+			av_addr[req->h2] = NULL;
+		}
 		hdl_del(req->h2);
 		break;
 

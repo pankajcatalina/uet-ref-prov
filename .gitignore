@@ -1,0 +1,16 @@
+# Build output. Tracking these caused two distinct failures: objects check out
+# NEWER than their sources (so make skips the rebuild and you silently run
+# another machine's binaries), and they block "git checkout" on any machine
+# that has already built the tree.
+*.o
+*.so
+obj_*/
+uet
+uet_shim/uet_shim_guest
+uet_shim/xport_test
+uet_shim/shim_smoke
+uet_shim/host-pkg/xport_test
+uet_shim/host-pkg/shim_smoke
+
+# Exception: no build tree for the provider ships here, so its .so must stay.
+!uet_provider/libuetprov-fi.so
