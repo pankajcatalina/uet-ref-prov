@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <arpa/inet.h>
 
 #include "uet_api.h"
@@ -193,9 +194,21 @@ int main(int argc, char **argv)
 		STEP(++step, "uet_cq_read() on the rx cq");
 		{
 			struct fi_cq_tagged_entry e[8];
-			int i;
+			const char *w = getenv("UET_SMOKE_WAIT");
+			time_t deadline;
+			int got = 0;
 
-			for (i = 0; i < 2000000; i++) {
+			/* A fixed poll count is a timeout in disguise: every
+			 * uet_cq_read() here is one shared-memory round trip
+			 * (~1.1 us), so 2e6 polls was only ~2 s - less than the
+			 * time it takes to start the client in another terminal,
+			 * and it reported "nothing arrived" for a healthy path.
+			 * Bound it by the wall clock, overridable for scripts. */
+			deadline = time(NULL) + (w ? atoi(w) : 60);
+			printf("     waiting up to %lds (UET_SMOKE_WAIT)\n",
+			       (long)(w ? atoi(w) : 60));
+
+			while (time(NULL) < deadline) {
 				ssize_t n = uet_cq_read(rxcq, e, 8);
 
 				if (n > 0) {
@@ -211,6 +224,7 @@ int main(int argc, char **argv)
 						printf(" %02x",
 						       (unsigned char)buf[j]);
 					printf("\n");
+					got = 1;
 					break;
 				}
 				if ((n < 0) && (n != -FI_EAGAIN)) {
@@ -221,10 +235,11 @@ int main(int argc, char **argv)
 						printf("     cq err: err=%d "
 						       "prov_errno=%d\n",
 						       ee.err, ee.prov_errno);
+					got = 1;   /* an error is still an outcome */
 					break;
 				}
 			}
-			if (i == 2000000)
+			if (!got)
 				printf("     nothing arrived\n");
 		}
 		goto teardown;
