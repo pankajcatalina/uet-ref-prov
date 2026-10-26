@@ -283,6 +283,33 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 	rsp->seq = req->seq;              /* echo it: the host matches on this */
 	rsp->ret = -EINVAL;
 
+	/*
+	 * Reject a handle id that is not live, before any handler can pass it
+	 * to the stack.
+	 *
+	 * hdl_get() answers NULL for an id that was never issued or has been
+	 * closed, and the stack dereferences its handles without checking -
+	 * uet_ep_close(NULL) is an immediate segfault. A fresh guest once
+	 * received "EP_CLOSE h1=11" from a host session that outlived the
+	 * previous guest, and died on it.
+	 *
+	 * Zero is SHIM_HANDLE_NONE and legitimately means "no handle", so
+	 * only non-zero ids are checked. a3 is not: it carries an address
+	 * handle for some ops and flags or a context id for others, so it
+	 * cannot be validated without per-op knowledge, and the handlers
+	 * that use it as a handle pass it to code that tolerates NULL.
+	 */
+	if (((req->h1 != SHIM_HANDLE_NONE) && (hdl_get(req->h1) == NULL)) ||
+	    ((req->h2 != SHIM_HANDLE_NONE) && (hdl_get(req->h2) == NULL))) {
+		LOG("%-12s rejected: stale handle h1=%llu h2=%llu "
+		    "(is an old host still attached?)\n",
+		    shim_op_name(req->op),
+		    (unsigned long long)req->h1,
+		    (unsigned long long)req->h2);
+		rsp->ret = -EINVAL;
+		return;
+	}
+
 	switch (req->op) {
 
 	/* ------------------------------------------------- lifecycle */
