@@ -826,6 +826,7 @@ int uet_mr_disable(uet_mr_handle_t mr_handle)
 int uet_mr_close(uet_mr_handle_t mr_handle)
 {
 	struct shim_hdr h = { .h2 = shim_p2h(mr_handle) };
+	shim_handle_t key = shim_p2h(mr_handle);
 	uint64_t off = 0;
 	size_t i;
 	int rc;
@@ -835,9 +836,27 @@ int uet_mr_close(uet_mr_handle_t mr_handle)
 	 * memory to the next allocation. */
 	rc = (int)shim_rpc(SHIM_MR_CLOSE, &h, NULL, 0, NULL, 0, NULL);
 
+	/*
+	 * Reclaim ONLY if the guest actually closed it. uet_mr_close() fails
+	 * with -FI_EINVAL while an MR is still enabled and bound to an
+	 * endpoint, and freeing the block anyway handed live, still-
+	 * registered memory to the next allocation - the next section then
+	 * registered a second MR over the same bytes and the test reported
+	 * "Invalid buffer contents". Leaking a block is much better than
+	 * aliasing one.
+	 *
+	 * h.h2 is read BEFORE shim_rpc() overwrote it with the reply, which
+	 * is why the handle is captured in `key` up front.
+	 */
+	if (rc != 0) {
+		fprintf(stderr, "[shim/host] mr_close failed (%d); keeping the "
+				"arena block to avoid aliasing it\n", rc);
+		return rc;
+	}
+
 	pthread_mutex_lock(&mr_lock);
 	for (i = 0; i < MR_MAX; i++) {
-		if (mr_tbl[i].used && (mr_tbl[i].h == h.h2)) {
+		if (mr_tbl[i].used && (mr_tbl[i].h == key)) {
 			off = mr_tbl[i].off;
 			memset(&mr_tbl[i], 0, sizeof(mr_tbl[i]));
 			break;
