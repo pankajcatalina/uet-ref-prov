@@ -219,9 +219,11 @@ struct uet_pds_state {
 	uint32_t              new_pdc_timeout_cnt; /* PENDING PDCs reaped */
 	uint32_t              psn_range_close_cnt; /* PDCs closed PSN range */
 	uint32_t              pdc_close_in_err_cnt; /* PDCs closed in error */
-	uint64_t              tx_pkt_cnt;      /* data packets put on the wire */
+	uint64_t              tx_pkt_cnt;      /* SES data packets, first try */
+	uint64_t              tx_ctrl_cnt;     /* PDS control packets (SYN etc) */
+	uint64_t              tx_nack_cnt;     /* NACKs put on the wire */
 	uint64_t              tx_ack_cnt;      /* acks put on the wire */
-	uint64_t              retransmit_cnt;  /* packets actually resent */
+	uint64_t              retransmit_cnt;  /* data packets actually resent */
 	uint64_t              retry_exceeded_cnt; /* PDCs given up on */
 	uint64_t              ack_rx_cnt;      /* acks received */
 	uint64_t              ack_accept_cnt;  /* acks that retired a packet */
@@ -415,23 +417,51 @@ static void uet_pds_close_pdc_in_error(struct uet_instance *uet,
 /*                       Security and NIC Shim APIs                         */
 /****************************************************************************/
 
+/*
+ * What kind of packet is going out. A bool was not enough: only DATA draws
+ * an ack from the peer, so counting control packets and NACKs as "send"
+ * made send exceed "ack received" and the arithmetic stopped checking out.
+ */
+typedef enum {
+	UET_PDS_TX_DATA = 0,   /* SES payload - the peer acks this */
+	UET_PDS_TX_CTRL,       /* PDS control, e.g. SYN and close */
+	UET_PDS_TX_NACK,
+	UET_PDS_TX_ACK,
+} uet_pds_tx_kind_t;
+
 /* Counted here, at the one place a packet actually reaches the NIC, so a
  * packet suppressed by the random-drop test harness is not counted as sent.
- * tx_pkt distinguishes a data packet from an ack. */
-static void uet_pds_count_tx(bool tx_pkt)
+ * A retransmit is counted as a retransmit and not also as a send, so
+ * send + retransmit is the number of data packets that left. */
+static void uet_pds_count_tx(uet_pds_tx_kind_t kind, bool is_rtx)
 {
-	if (tx_pkt)
-		pds_state.tx_pkt_cnt++;
-	else
+	switch (kind) {
+	case UET_PDS_TX_DATA:
+		if (is_rtx)
+			pds_state.retransmit_cnt++;
+		else
+			pds_state.tx_pkt_cnt++;
+		break;
+	case UET_PDS_TX_CTRL:
+		pds_state.tx_ctrl_cnt++;
+		break;
+	case UET_PDS_TX_NACK:
+		pds_state.tx_nack_cnt++;
+		break;
+	case UET_PDS_TX_ACK:
 		pds_state.tx_ack_cnt++;
+		break;
+	}
 }
 
 static int uet_pds_sec_tx_pkt(struct uet_instance *uet,
 			      struct uet_pdc *pdc,
 			      struct uet_pdc_pkt *pdc_pkt,
-			      bool tx_pkt, /* false = tx_ack */
+			      uet_pds_tx_kind_t kind,
 			      bool is_rtx)
 {
+	const bool tx_pkt = (kind != UET_PDS_TX_ACK);
+
 	uint8_t *pkt_buf;
 	int pkt_buf_len;
 	uint8_t **pkt;
@@ -504,7 +534,7 @@ static int uet_pds_sec_tx_pkt(struct uet_instance *uet,
 			return 0;
 		}
 
-		uet_pds_count_tx(tx_pkt);
+		uet_pds_count_tx(kind, is_rtx);
 
 		if (imp_shim_is_enabled())
 			return imp_shim_tx_pkt(UET_NIC(uet), *pkt, pp->ip,
@@ -584,7 +614,7 @@ static int uet_pds_sec_tx_pkt(struct uet_instance *uet,
 		return 0;
 	}
 
-	uet_pds_count_tx(tx_pkt);
+	uet_pds_count_tx(kind, is_rtx);
 
 	if (imp_shim_is_enabled())
 		return imp_shim_tx_pkt(UET_NIC(uet), new_pkt, pp->ip,
@@ -1474,7 +1504,7 @@ static int uet_pds_send_ctrl_pkt(struct uet_instance *uet,
 	}
 
 	/* send the packet */
-	rc = uet_pds_sec_tx_pkt(uet, pdc, pdc_pkt, true, false);
+	rc = uet_pds_sec_tx_pkt(uet, pdc, pdc_pkt, UET_PDS_TX_CTRL, false);
 	if (rc != 0) {
 		UET_PDS_ERR("failed to send %s for PDC %u",
 			    PDS_CTRL_TYPE_TO_STR(ctrl_type), pdc->pdc_id);
@@ -1780,6 +1810,10 @@ void uet_pds_finalize(struct uet_instance *uet)
 		     (unsigned long long)pds_state.tx_pkt_cnt);
 	UET_PDS_INFO(" %-18s %10llu", "retransmit",
 		     (unsigned long long)pds_state.retransmit_cnt);
+	UET_PDS_INFO(" %-18s %10llu", "ctrl sent",
+		     (unsigned long long)pds_state.tx_ctrl_cnt);
+	UET_PDS_INFO(" %-18s %10llu", "nack sent",
+		     (unsigned long long)pds_state.tx_nack_cnt);
 	UET_PDS_INFO(" %-18s %10llu", "ack sent",
 		     (unsigned long long)pds_state.tx_ack_cnt);
 	UET_PDS_INFO(" %-18s %10llu", "ack received",
@@ -1957,7 +1991,7 @@ static int uet_pds_tx_nack(struct uet_instance *uet,
 				   !pdc->sec_enabled);
 	}
 
-	rc = uet_pds_sec_tx_pkt(uet, pdc, pdc_pkt, true, false);
+	rc = uet_pds_sec_tx_pkt(uet, pdc, pdc_pkt, UET_PDS_TX_NACK, false);
 	if (rc != 0) {
 		UET_PDS_ERR("failed to send NACK packet for PDC %u",
 			    pdc->pdc_id);
@@ -2295,7 +2329,7 @@ int uet_pds_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
 	}
 
 	/* send the packet */
-	rc = uet_pds_sec_tx_pkt(uet, pdc, pdc_pkt, true, false);
+	rc = uet_pds_sec_tx_pkt(uet, pdc, pdc_pkt, UET_PDS_TX_DATA, false);
 	if (rc != 0) {
 		bm_unset(pdc->tx_bm, tx_bm_idx);
 		if (mapped_msg_id) {
@@ -2410,7 +2444,7 @@ static int uet_pds_rtx_pkt(struct uet_instance *uet,
 	pdc_pkt->pkt_pp.pds_flags |= UET_PDS_REQ_FLAGS_RETX;
 
 	/* retransmit the packet */
-	rc = uet_pds_sec_tx_pkt(uet, pdc, pdc_pkt, true, true);
+	rc = uet_pds_sec_tx_pkt(uet, pdc, pdc_pkt, UET_PDS_TX_DATA, true);
 	if (rc != 0)
 		return rc;
 
@@ -2463,7 +2497,6 @@ static int uet_pds_check_rtx_pkt(struct uet_instance *uet,
 		return -EIO; /* assume this PDC is dead */
 	}
 
-	pds_state.retransmit_cnt++;
 	return -EAGAIN; /* pkt retransmitted, could be more */
 }
 
@@ -2876,7 +2909,7 @@ static int uet_pds_tx_ack_pkt(struct uet_instance *uet,
 			      ses_hdr_len, pds_ack_hdr_len);
 
 	/* send the ACK packet */
-	rc = uet_pds_sec_tx_pkt(uet, pdc, pdc_pkt, false, false);
+	rc = uet_pds_sec_tx_pkt(uet, pdc, pdc_pkt, UET_PDS_TX_ACK, false);
 	if (rc != 0) {
 		pdc_pkt->needs_clear = false;
 		pdc_pkt->ack_len = 0;
@@ -2981,7 +3014,7 @@ static int uet_pds_tx_close_ack_epsn(struct uet_instance *uet,
 	ack_epsn->payload = htonl(payload);
 
 	/* send the ACK packet */
-	rc = uet_pds_sec_tx_pkt(uet, pdc, pdc_pkt, false, false);
+	rc = uet_pds_sec_tx_pkt(uet, pdc, pdc_pkt, UET_PDS_TX_ACK, false);
 	if (rc != 0) {
 		pdc_pkt->ack_len = 0;
 		free(pdc_pkt->ack_buf);
@@ -3110,7 +3143,7 @@ static int uet_pds_tx_def_rsp_ack_pkt(struct uet_instance *uet,
 	ack_ses->msg_id = htons(pdc_pkt->pkt_pp.ses_msg_id);
 
 	/* send the default response ACK packet */
-	rc = uet_pds_sec_tx_pkt(uet, pdc, &tmp_pdc_pkt, false, false);
+	rc = uet_pds_sec_tx_pkt(uet, pdc, &tmp_pdc_pkt, UET_PDS_TX_ACK, false);
 	if (rc != 0) {
 		free(def_rsp_buf);
 		return rc;
@@ -3172,7 +3205,7 @@ static int uet_pds_check_duplicate_and_rtx(struct uet_instance *uet,
 		*rtx = true;
 	} else if (orig_pkt->ack) {
 		/* resend previous ACK/response */
-		rc = uet_pds_sec_tx_pkt(uet, pdc, orig_pkt, false, true);
+		rc = uet_pds_sec_tx_pkt(uet, pdc, orig_pkt, UET_PDS_TX_ACK, true);
 		if (rc != 0)
 			return rc;
 
@@ -3545,7 +3578,7 @@ static int uet_pds_reestablish_start_psn(struct uet_instance *uet,
 
 		pdc_pkt->tx_retry_cnt = 0;
 
-		if (uet_pds_sec_tx_pkt(uet, pdc, pdc_pkt, true, true) != 0)
+		if (uet_pds_sec_tx_pkt(uet, pdc, pdc_pkt, UET_PDS_TX_DATA, true) != 0)
 			UET_PDS_ERR("PDC %u re-drive Tx failed (PSN %u)",
 				    pdc->pdc_id, pdc_pkt->psn);
 	}
@@ -3984,7 +4017,7 @@ static int uet_pds_process_ack_req_cp(struct uet_instance *uet,
 	}
 
 	/* resend previous ACK/response */
-	rc = uet_pds_sec_tx_pkt(uet, pdc, orig_pdc_pkt, false, true);
+	rc = uet_pds_sec_tx_pkt(uet, pdc, orig_pdc_pkt, UET_PDS_TX_ACK, true);
 	if (rc != 0)
 		return rc;
 
