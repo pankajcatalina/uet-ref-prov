@@ -4009,6 +4009,12 @@ static uet_ses_rc_t uet_rx_req_pkt(
 			}
 
 			if (rx_desc == NULL) {
+				UET_API_ERR("TAGDBG miss   ep=%p "
+					    "tag=0x%016llx initiator=0x%08x "
+					    "(also tried wildcard)",
+					    (void *)uet_ep,
+					    (unsigned long long)tag_key.tag,
+					    (unsigned)tag_key.initiator);
 				ses_rc = UET_RC_NO_MATCH;
 				if (pp->ses_opcode == UET_DEFER_TSEND)
 					ses_rc = uet_rx_dsend(uet_ep, pp, list,
@@ -6076,7 +6082,13 @@ static ssize_t uet_recv_api_common(
 			rx_desc->tag_key.initiator =
 				htonl(av_entry->addr->initiator_id);
 		}
-		uet_tag_initiator_hash_insert(uet_ep, rx_desc);
+		UET_API_ERR("TAGDBG insert ep=%p tag=0x%016llx initiator=0x%08x "
+		    "invalid=%d",
+		    (void *)uet_ep,
+		    (unsigned long long)rx_desc->tag_key.tag,
+		    (unsigned)rx_desc->tag_key.initiator,
+		    (int)rx_desc->tag_key.initiator_invalid);
+	uet_tag_initiator_hash_insert(uet_ep, rx_desc);
 
 		if (uet_ep->tagged_gen_disabled) {
 			/* re-enable generation */
