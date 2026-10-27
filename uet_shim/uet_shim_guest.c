@@ -1065,6 +1065,28 @@ int main(int argc, char **argv)
 
 			handle_one(&req, &rsp);
 
+			/*
+			 * ALWAYS report a failure, past the 64-call cap.
+			 *
+			 * A negative return is the only record of which call
+			 * the application saw fail, and the host cannot
+			 * supply it: by the time the provider reports an
+			 * error upward the opcode is gone. NCCL's
+			 * "Could not send request for device 0. RC: -22" was
+			 * untraceable for exactly this reason.
+			 */
+			if (rsp.ret < 0)
+				LOG("%-12s -> %lld  h1=%llu h2=%llu len=%u "
+				    "off=%llu a1=%llu a2=%llu a3=%llu\n",
+				    shim_op_name(req.op), (long long)rsp.ret,
+				    (unsigned long long)req.h1,
+				    (unsigned long long)req.h2,
+				    req.payload_len,
+				    (unsigned long long)req.off,
+				    (unsigned long long)req.a1,
+				    (unsigned long long)req.a2,
+				    (unsigned long long)req.a3);
+
 			if (shim_send_msg(fd, &rsp, g_out) != 0) {
 				LOG("reply failed\n");
 				break;
