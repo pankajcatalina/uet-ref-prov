@@ -136,6 +136,29 @@ static pthread_mutex_t mr_lock = PTHREAD_MUTEX_INITIALIZER;
  * matching arena offset. Partial overlap deliberately returns 0: staging
  * half a buffer would be worse than copying all of it.
  */
+/*
+ * Failures are reported unconditionally; the per-call success trace is
+ * noisier than it is useful, so it waits behind UET_SHIM_TRACE=1.
+ *
+ * This exists because shim_rpc()'s claim to show you everything is only
+ * true of calls that REACH it. A data-path call refused here - no arena
+ * space, no free context slot - returns to the provider without ever
+ * becoming a message, so it leaves no trace on either side of the wire.
+ * That is the one failure mode the guest log structurally cannot explain,
+ * and the one NCCL's "RC: -22" turned out to need.
+ */
+static int shim_trace(void)
+{
+	static int t = -1;
+
+	if (t < 0) {
+		const char *s = getenv("UET_SHIM_TRACE");
+
+		t = ((s != NULL) && (*s != '\0') && (*s != '0')) ? 1 : 0;
+	}
+	return t;
+}
+
 static uint64_t mr_off_for(const void *buf, size_t len)
 {
 	const char *p = buf;
@@ -227,14 +250,21 @@ static int stage_iov(const struct iovec *iov, size_t n,
 	st->off = 0;
 	st->owned = 0;
 
-	if ((n == 0) || (n > SHIM_MAX_IOV))
+	if ((n == 0) || (n > SHIM_MAX_IOV)) {
+		fprintf(stderr, "[shim/host] stage_iov: %zu segments, the "
+			"limit is %u\n", n, SHIM_MAX_IOV);
 		return -FI_EINVAL;
+	}
 	if (total == 0)
 		return -FI_EINVAL;
 
 	st->off = shim_arena_alloc(total);
-	if (st->off == 0)
+	if (st->off == 0) {
+		fprintf(stderr, "[shim/host] stage_iov: no arena space for "
+			"%zu bytes (%zu free of %zu)\n",
+			total, shim_arena_avail(), shim_arena_size());
 		return -FI_ENOMEM;
+	}
 	st->owned = 1;
 
 	for (i = 0; i < n; i++) {
@@ -288,8 +318,12 @@ static int stage_tx(const void *buf, size_t len, struct stage *st)
 				       * copy: a zero-length buffer outside
 				       * any region has no arena address */
 		st->off = shim_arena_alloc(len);
-		if (st->off == 0)
+		if (st->off == 0) {
+			fprintf(stderr, "[shim/host] stage_tx: no arena space "
+				"for %zu bytes (%zu free of %zu)\n",
+				len, shim_arena_avail(), shim_arena_size());
 			return -FI_ENOMEM;
+		}
 		st->owned = 1;
 	}
 
@@ -298,6 +332,9 @@ static int stage_tx(const void *buf, size_t len, struct stage *st)
 
 	dst = shim_arena_ptr(st->off, len);
 	if (dst == NULL) {
+		fprintf(stderr, "[shim/host] stage_tx: arena offset %llu len "
+			"%zu is out of bounds\n",
+			(unsigned long long)st->off, len);
 		if (st->owned)
 			shim_arena_free(st->off);
 		st->off = 0;
@@ -320,8 +357,12 @@ static int stage_rx(void *buf, size_t len, struct stage *st)
 	st->off = mr_off_for(buf, len);
 	if ((st->off == 0) && (len > 0)) {
 		st->off = shim_arena_alloc(len);
-		if (st->off == 0)
+		if (st->off == 0) {
+			fprintf(stderr, "[shim/host] stage_rx: no arena space "
+				"for %zu bytes (%zu free of %zu)\n",
+				len, shim_arena_avail(), shim_arena_size());
 			return -FI_ENOMEM;
+		}
 		st->owned = 1;
 	}
 	return 0;
@@ -344,6 +385,11 @@ static int64_t shim_rpc(uint32_t op, struct shim_hdr *h,
 			uint32_t *reply_len)
 {
 	struct shim_hdr rsp;
+	/* the request's own arguments: shim_rpc() hands the REPLY back
+	 * through *h, so by the time there is a result to report these are
+	 * gone. Snapshot them while they still mean something. */
+	const uint64_t q1 = h->a1, q2 = h->a2, q3 = h->a3, q4 = h->a4;
+	const uint64_t qh1 = h->h1, qh2 = h->h2, qoff = h->off;
 	int rc;
 
 	/*
@@ -404,6 +450,15 @@ static int64_t shim_rpc(uint32_t op, struct shim_hdr *h,
 	h->h2 = rsp.h2;
 	h->a1 = rsp.a1;
 	h->a2 = rsp.a2;
+
+	if ((rsp.ret < 0) || shim_trace())
+		fprintf(stderr, "[shim/host] %-12s -> %lld  h1=%llu h2=%llu "
+			"off=%llu a1=%llu a2=%llu a3=%llu a4=%llu\n",
+			shim_op_name(op), (long long)rsp.ret,
+			(unsigned long long)qh1, (unsigned long long)qh2,
+			(unsigned long long)qoff,
+			(unsigned long long)q1, (unsigned long long)q2,
+			(unsigned long long)q3, (unsigned long long)q4);
 
 	pthread_mutex_unlock(&g_lock);
 	return rsp.ret;

@@ -50,6 +50,10 @@
 #include "uet_shim_arena.h"
 
 static int g_verbose = 1;
+/* How many calls to trace before falling silent. The default keeps a long
+ * data run readable; UET_SHIM_LOG_CALLS=0 lifts the cap entirely, which is
+ * what you want when the interesting call is the ten-thousandth. */
+static unsigned long g_log_calls = 64;
 
 #define LOG(...)                                            \
 	do {                                                \
@@ -1005,6 +1009,13 @@ int main(int argc, char **argv)
 	if ((argc > 1) && (strcmp(argv[1], "-q") == 0))
 		g_verbose = 0;
 
+	{
+		const char *s = getenv("UET_SHIM_LOG_CALLS");
+
+		if (s != NULL)
+			g_log_calls = strtoul(s, NULL, 0);
+	}
+
 	if (getenv("UET_IFNAME") == NULL) {
 		fprintf(stderr, "[shim/guest] UET_IFNAME is not set - the "
 				"stack will fail to open its raw socket\n");
@@ -1054,9 +1065,10 @@ int main(int argc, char **argv)
 				break;
 			}
 			calls++;
-			/* log the first 64 calls: enough to see the whole
-			 * setup sequence without drowning a long data run */
-			if (g_verbose && (calls <= 64))
+			/* log the first g_log_calls calls: enough to see the
+			 * whole setup sequence without drowning a long run */
+			if (g_verbose &&
+			    ((g_log_calls == 0) || (calls <= g_log_calls)))
 				LOG("<- %-12s h1=%llu h2=%llu len=%u\n",
 				    shim_op_name(req.op),
 				    (unsigned long long)req.h1,
