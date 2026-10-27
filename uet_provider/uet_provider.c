@@ -210,15 +210,28 @@ static ssize_t uet_prov_cq_readerr(struct fid_cq *cq,
 	ssize_t ret;
 	(void)flags;
 	int i;
+	/*
+	 * uet_cq_readerr() answers -FI_EAGAIN for "this CQ holds no error
+	 * entry" (uet_api.c), so a non-zero return is NOT the same as
+	 * "found it". Treating it that way stopped the scan at
+	 * rx_cq_handle[0] and left an error entry sitting on any later CQ
+	 * undrained: uet_cq_read() went on reporting -FI_EAVAIL for it, the
+	 * caller went on calling readerr, and neither ever made progress.
+	 * NCCL's sendrecv spun ~1.2M times round that loop.
+	 *
+	 * Only a positive return means an entry was copied out. -FI_EAGAIN
+	 * means keep looking; any other negative is a real failure and is
+	 * worth reporting immediately.
+	 */
 	for(i=0;i<ucq->num_rx_bound;i++){
-//	if(ucq->rx_bound){
                 ret= uet_cq_readerr(ucq->rx_cq_handle[i], buf);
-		if(ret!=0) return ret;
+		if(ret>0) return ret;
+		if((ret<0) && (ret!=-FI_EAGAIN)) return ret;
 	}
 	for(i=0;i<ucq->num_tx_bound;i++){
-//        if(ucq->tx_bound){ 
                 ret= uet_cq_readerr(ucq->tx_cq_handle[i], buf);
-		if(ret!=0) return ret;
+		if(ret>0) return ret;
+		if((ret<0) && (ret!=-FI_EAGAIN)) return ret;
 	}
         return -FI_EAGAIN;
 
