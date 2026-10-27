@@ -1075,6 +1075,34 @@ int main(int argc, char **argv)
 				    (unsigned long long)req.h2,
 				    req.payload_len);
 
+			/*
+			 * The tag travels in the payload, not in a1..a4, so
+			 * the generic line above cannot show it - and a
+			 * tagged message that fails to match is invisible
+			 * without it. uet_api.c matches on htonll(tag) alone
+			 * and rejects any ignore mask outright, so the two
+			 * values below are the whole matching key. Tagged
+			 * calls are rare next to CQ_READ, so these are
+			 * logged unconditionally rather than under the cap.
+			 */
+			if (((req.op == SHIM_TSEND) ||
+			     (req.op == SHIM_TSENDV) ||
+			     (req.op == SHIM_TRECV) ||
+			     (req.op == SHIM_TRECVV)) &&
+			    (req.payload_len >= sizeof(struct shim_tag_args))) {
+				const struct shim_tag_args *ta =
+					(const struct shim_tag_args *)g_in;
+
+				LOG("%-12s tag=0x%016llx ignore=0x%016llx "
+				    "ep=%llu mr=%llu peer=%llu\n",
+				    shim_op_name(req.op),
+				    (unsigned long long)ta->tag,
+				    (unsigned long long)ta->ignore,
+				    (unsigned long long)req.h1,
+				    (unsigned long long)req.h2,
+				    (unsigned long long)req.a3);
+			}
+
 			handle_one(&req, &rsp);
 
 			/*
