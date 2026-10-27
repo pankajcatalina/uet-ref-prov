@@ -15,6 +15,7 @@
 #include "uet_api.h"
 #include "uet_pds.h"
 #include "uet_api_private.h"
+#include "uet_log.h"
 #include "uet_pkt_chk.h"
 #include "uet_nic.h"
 #include "crc32c.h"
