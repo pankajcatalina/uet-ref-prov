@@ -232,6 +232,9 @@ struct uet_pds_state {
 static struct uet_pds_state pds_state;
 
 static int pds_pdc_close_thresh = UET_PDC_CLOSE_THRESH;
+
+/* UET_SEC_MODE, read once at initialize rather than per packet */
+static bool pds_sec_enabled;
 static int pds_pkt_drop_thresh = UET_PKT_DROP_THRESH;
 
 /* New_PDC_Time DoS timer, how long a half-open (PENDING) PDC is held */
@@ -627,10 +630,23 @@ static int uet_pds_sec_rx_pkt(struct uet_instance *uet,
 	if (rc != 1)
 		goto err_exit;
 
-	/* decrypt the packet if the security header is present */
-	rc = uet_sec_dec_pkt(uet, *pkt, *pkt_len, &tag_len);
-	if (rc != 0)
-		goto err_exit;
+	/*
+	 * Decrypt only when security is configured.
+	 *
+	 * uet_sec_dec_pkt() parses a security header at a fixed offset and,
+	 * finding something that is not one, counts the packet as an
+	 * encryption bypass and returns success. With UET_SEC_MODE unset
+	 * there is never a security header, so every received packet took
+	 * that path and in_rx_encryption_bypass_pkts counted the whole run.
+	 * That is why a pds run reported a non-zero bypass count while an
+	 * sng run reported zero: SNG's receive path does not call this at
+	 * all.
+	 */
+	if (pds_sec_enabled) {
+		rc = uet_sec_dec_pkt(uet, *pkt, *pkt_len, &tag_len);
+		if (rc != 0)
+			goto err_exit;
+	}
 
 	return 1;
 
@@ -1608,6 +1624,8 @@ int uet_pds_initialize(struct uet_instance *uet)
 
 	/* seed random number generator for PDC close and packet drop */
 	srand(time(NULL));
+
+	pds_sec_enabled = !!getenv(UET_SEC_MODE);
 
 	/* configure the random PDC close threshold */
 	if (getenv("UET_PDC_CLOSE_THRESH")) {
