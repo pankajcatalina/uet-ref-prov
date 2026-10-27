@@ -220,7 +220,6 @@ struct uet_pds_state {
 	uint32_t              psn_range_close_cnt; /* PDCs closed PSN range */
 	uint32_t              pdc_close_in_err_cnt; /* PDCs closed in error */
 	uint64_t              tx_pkt_cnt;      /* SES data packets, first try */
-	uint64_t              tx_ctrl_cnt;     /* PDS control packets (SYN etc) */
 	uint64_t              tx_nack_cnt;     /* NACKs put on the wire */
 	uint64_t              tx_ack_cnt;      /* acks put on the wire */
 	uint64_t              retransmit_cnt;  /* data packets actually resent */
@@ -443,7 +442,11 @@ static void uet_pds_count_tx(uet_pds_tx_kind_t kind, bool is_rtx)
 			pds_state.tx_pkt_cnt++;
 		break;
 	case UET_PDS_TX_CTRL:
-		pds_state.tx_ctrl_cnt++;
+		/* Deliberately not counted. CLOSE and CLOSE_REQ are tracked
+		 * and drawn acks, ACK_REQ and CLEAR are not, so one figure
+		 * could not be read against "ack received" either way. The
+		 * kind still exists so control traffic is not counted as
+		 * data. */
 		break;
 	case UET_PDS_TX_NACK:
 		pds_state.tx_nack_cnt++;
@@ -1810,8 +1813,6 @@ void uet_pds_finalize(struct uet_instance *uet)
 		     (unsigned long long)pds_state.tx_pkt_cnt);
 	UET_PDS_INFO(" %-18s %10llu", "retransmit",
 		     (unsigned long long)pds_state.retransmit_cnt);
-	UET_PDS_INFO(" %-18s %10llu", "ctrl sent",
-		     (unsigned long long)pds_state.tx_ctrl_cnt);
 	UET_PDS_INFO(" %-18s %10llu", "nack sent",
 		     (unsigned long long)pds_state.tx_nack_cnt);
 	UET_PDS_INFO(" %-18s %10llu", "ack sent",
