@@ -369,8 +369,31 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 	case SHIM_GETNAME:
 		rsp->ret = uet_getname(hdl_get(req->h1),
 				       (struct uet_addr *)g_out);
-		if (rsp->ret == 0)
+		if (rsp->ret == 0) {
+			const struct uet_addr *a =
+				(const struct uet_addr *)g_out;
+
 			rsp->payload_len = sizeof(struct uet_addr);
+			/*
+			 * uet_ep_key is {dest ip, pid_on_fep, index}, so
+			 * these three decide which endpoint an inbound
+			 * packet is demuxed to. uet_endpoint() fills them
+			 * from UET_ADDR_DEF_* unless an address-management
+			 * layer supplied values, which means every endpoint
+			 * on a node can end up sharing one key - and a
+			 * tagged receive posted on one of them is then
+			 * invisible to a packet that lands on another.
+			 * Print them per endpoint so that is visible rather
+			 * than inferred.
+			 */
+			LOG("GETNAME      ep=%llu pid_on_fep=%u "
+			    "start_index=%u num_indices=%u initiator=%u\n",
+			    (unsigned long long)req->h1,
+			    (unsigned)a->pid_on_fep,
+			    (unsigned)a->start_index,
+			    (unsigned)a->num_indices,
+			    (unsigned)a->initiator_id);
+		}
 		break;
 
 	/* ---------------------------------------------------- domain */
