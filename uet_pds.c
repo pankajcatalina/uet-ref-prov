@@ -219,9 +219,14 @@ struct uet_pds_state {
 	uint32_t              new_pdc_timeout_cnt; /* PENDING PDCs reaped */
 	uint32_t              psn_range_close_cnt; /* PDCs closed PSN range */
 	uint32_t              pdc_close_in_err_cnt; /* PDCs closed in error */
-	uint64_t              tx_req_cnt;      /* transmits asked for by SES */
+	uint64_t              tx_pkt_cnt;      /* data packets put on the wire */
+	uint64_t              tx_ack_cnt;      /* acks put on the wire */
 	uint64_t              retransmit_cnt;  /* packets actually resent */
 	uint64_t              retry_exceeded_cnt; /* PDCs given up on */
+	uint64_t              ack_rx_cnt;      /* acks received */
+	uint64_t              ack_accept_cnt;  /* acks that retired a packet */
+	uint64_t              ack_dup_cnt;     /* acks for an already-acked PSN */
+	uint64_t              ack_drop_cnt;    /* acks discarded as invalid */
 };
 
 static struct uet_pds_state pds_state;
@@ -407,6 +412,17 @@ static void uet_pds_close_pdc_in_error(struct uet_instance *uet,
 /*                       Security and NIC Shim APIs                         */
 /****************************************************************************/
 
+/* Counted here, at the one place a packet actually reaches the NIC, so a
+ * packet suppressed by the random-drop test harness is not counted as sent.
+ * tx_pkt distinguishes a data packet from an ack. */
+static void uet_pds_count_tx(bool tx_pkt)
+{
+	if (tx_pkt)
+		pds_state.tx_pkt_cnt++;
+	else
+		pds_state.tx_ack_cnt++;
+}
+
 static int uet_pds_sec_tx_pkt(struct uet_instance *uet,
 			      struct uet_pdc *pdc,
 			      struct uet_pdc_pkt *pdc_pkt,
@@ -485,6 +501,8 @@ static int uet_pds_sec_tx_pkt(struct uet_instance *uet,
 			return 0;
 		}
 
+		uet_pds_count_tx(tx_pkt);
+
 		if (imp_shim_is_enabled())
 			return imp_shim_tx_pkt(UET_NIC(uet), *pkt, pp->ip,
 					       new_pkt_len);
@@ -562,6 +580,8 @@ static int uet_pds_sec_tx_pkt(struct uet_instance *uet,
 			    (tx_pkt) ? "Tx" : "ACK");
 		return 0;
 	}
+
+	uet_pds_count_tx(tx_pkt);
 
 	if (imp_shim_is_enabled())
 		return imp_shim_tx_pkt(UET_NIC(uet), new_pkt, pp->ip,
@@ -1725,12 +1745,36 @@ void uet_pds_finalize(struct uet_instance *uet)
 		     pds_state.psn_range_close_cnt);
 	UET_PDS_INFO("%-30s : %u", "pdc_close_in_err_cnt",
 		     pds_state.pdc_close_in_err_cnt);
-	UET_PDS_INFO("%-30s : %llu", "tx_req_cnt",
-		     (unsigned long long)pds_state.tx_req_cnt);
-	UET_PDS_INFO("%-30s : %llu", "retransmit_cnt",
+
+	/* Same shape as the SNG block so a pds run and an sng run line up.
+	 * "ack duplicate" has no SNG equivalent: PDS reorders and coalesces
+	 * acks, so an ack for an already-retired PSN is normal rather than a
+	 * fault, and folding it into "dropped" would misread a healthy run. */
+	{
+		char host[64];
+
+		if (gethostname(host, sizeof(host)) != 0)
+			host[0] = '\0';
+		host[sizeof(host) - 1] = '\0';
+		UET_PDS_INFO("===== %s pid %d =====", host, (int)getpid());
+	}
+	UET_PDS_INFO(" %-18s %10llu", "send",
+		     (unsigned long long)pds_state.tx_pkt_cnt);
+	UET_PDS_INFO(" %-18s %10llu", "retransmit",
 		     (unsigned long long)pds_state.retransmit_cnt);
-	UET_PDS_INFO("%-30s : %llu", "retry_exceeded_cnt",
+	UET_PDS_INFO(" %-18s %10llu", "ack sent",
+		     (unsigned long long)pds_state.tx_ack_cnt);
+	UET_PDS_INFO(" %-18s %10llu", "ack received",
+		     (unsigned long long)pds_state.ack_rx_cnt);
+	UET_PDS_INFO(" %-18s %10llu", "ack accepted",
+		     (unsigned long long)pds_state.ack_accept_cnt);
+	UET_PDS_INFO(" %-18s %10llu", "ack duplicate",
+		     (unsigned long long)pds_state.ack_dup_cnt);
+	UET_PDS_INFO(" %-18s %10llu", "ack dropped",
+		     (unsigned long long)pds_state.ack_drop_cnt);
+	UET_PDS_INFO(" %-18s %10llu", "retry exceeded",
 		     (unsigned long long)pds_state.retry_exceeded_cnt);
+	UET_PDS_INFO("==============================");
 
 	/* TODO: reclaim/free all packets stored in the bitmaps... */
 
@@ -1941,11 +1985,6 @@ int uet_pds_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
 	bool mapped_msg_id = false;
 
 	PDS_GO();
-
-	/* Counted at entry rather than at the wire: this is the one place
-	 * every SES transmit enters PDS, whereas a packet may leave through
-	 * several paths below. "asked for", not "put on the wire". */
-	pds_state.tx_req_cnt++;
 
 	uet = uet_ep->uet_domain->uet;
 	av_entry = (struct uet_av_entry *)dst_addr_handle;
@@ -3609,19 +3648,24 @@ static int uet_pds_process_ack(struct uet_instance *uet,
 	bool duplicate = false;
 	int rc;
 
+	pds_state.ack_rx_cnt++;
+
 	rc = uet_pdsm_get_pdc(pp->pds_dpdcid, false, &pdc);
 	if (rc != 0) {
+		pds_state.ack_drop_cnt++;
 		return rc;
 	}
 
 	if ((pdc->state != PDC_STATE_SYN) &&
 	    (pdc->dpdcid != pp->pds_spdcid)) {
+		pds_state.ack_drop_cnt++;
 		UET_PDS_WARN("invalid PDC %u (dpdcid %u != spdcid %u)",
 			     pdc->pdc_id, pdc->dpdcid, pp->pds_spdcid);
 		return -EINVAL;
 	}
 
 	if (UET_PDS_PSN_AFTER(pp->pds_cack_psn, pdc->next_psn - 1)) {
+		pds_state.ack_drop_cnt++;
 		UET_PDS_WARN("invalid CACK PSN %u on PDC %u (next PSN %u)",
 			     pp->pds_cack_psn, pp->pds_dpdcid, pdc->next_psn);
 		return -EINVAL;
@@ -3635,6 +3679,7 @@ static int uet_pds_process_ack(struct uet_instance *uet,
 	if (UET_PDS_PSN_AFTER(pdc->tx_bm_base_psn, pp->pds_psn)) {
 		duplicate = true;
 	} else if (!PSN_IN_MPR(pp->pds_psn, pdc->tx_bm_base_psn)) {
+		pds_state.ack_drop_cnt++;
 		UET_PDS_WARN("invalid ACK PSN %u on PDC %u "
 			     "(outside MPR %u[+%u])",
 			     pp->pds_psn, pp->pds_dpdcid,
@@ -3643,6 +3688,7 @@ static int uet_pds_process_ack(struct uet_instance *uet,
 	} else if (!bm_get(pdc->tx_bm,
 			   (pp->pds_psn - pdc->tx_bm_base_psn),
 			   (void **)&pdc_pkt)) {
+		pds_state.ack_drop_cnt++;
 		UET_PDS_WARN("invalid ACK PSN %u on PDC %u (packet not found)",
 			     pp->pds_psn, pp->pds_dpdcid);
 		return -EINVAL;
@@ -3655,8 +3701,11 @@ static int uet_pds_process_ack(struct uet_instance *uet,
 	 * by coalesced ack are processed separately.
 	 */
 	if (!duplicate) {
+		pds_state.ack_accept_cnt++;
 		pdc_pkt->tx_pkt_acked = true;
 		dlist_remove(&pdc_pkt->node); /* remove from Tx list */
+	} else {
+		pds_state.ack_dup_cnt++;
 	}
 
 	if (pp->pds_type == UET_PDS_TYPE_ACK_CC ||
