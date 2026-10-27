@@ -255,8 +255,42 @@ static int stage_iov(const struct iovec *iov, size_t n,
 			"limit is %u\n", n, SHIM_MAX_IOV);
 		return -FI_EINVAL;
 	}
-	if (total == 0)
-		return -FI_EINVAL;
+	/*
+	 * total == 0 is legitimate, not an error. libfabric permits a
+	 * zero-length send and NCCL's all_reduce ring issues one, which
+	 * rejecting here turned into -FI_EINVAL out of fi_tsend with
+	 * nothing logged on either side of the wire: the provider was
+	 * fine, the RPC was never sent, and the only evidence was NCCL's
+	 * "Could not send request ... RC: -22". sendrecv and broadcast
+	 * never send zero bytes, which is why only all_reduce saw it.
+	 *
+	 * The guest still needs a real address. A NULL buffer is rejected
+	 * by the stack even at length zero - uet.c:2201's zero-length
+	 * fence taught us that once already, and stage_tx(), stage_rx()
+	 * and mr_off_for() were all fixed for it while this path was not.
+	 * So prefer the registered region's own offset and fall back to a
+	 * minimal block, reporting each segment's length as given: zero.
+	 */
+	if (total == 0) {
+		st->off = mr_off_for(iov[0].iov_base, 0);
+		if (st->off == 0) {
+			st->off = shim_arena_alloc(SHIM_ARENA_ALIGN);
+			if (st->off == 0) {
+				fprintf(stderr, "[shim/host] stage_iov: no "
+					"arena space for a zero-length op "
+					"(%zu free of %zu)\n",
+					shim_arena_avail(),
+					shim_arena_size());
+				return -FI_ENOMEM;
+			}
+			st->owned = 1;
+		}
+		for (i = 0; i < n; i++) {
+			tbl[i].off = 0;
+			tbl[i].len = 0;
+		}
+		return 0;
+	}
 
 	st->off = shim_arena_alloc(total);
 	if (st->off == 0) {
