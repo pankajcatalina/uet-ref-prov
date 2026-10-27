@@ -6683,8 +6683,32 @@ int uet_initialize(uet_handle_t *handle)
 	uet->max_rtr_q_entries = UET_RTR_Q_ENTRIES_MAX;
 	uet->max_msg_retransmits = UET_MSG_RETRANSMIT_MAX;
 	uet->default_msg_ip_tos = uet_dscp_to_tos(UET_IP_DEFAULT_MSG_DSCP);
+	/*
+	 * Rendezvous is the only tolerance this stack has for a message
+	 * that arrives before its receive is posted: uet_rx_dsend() parks
+	 * an unexpected UET_DEFER_TSEND, while an unexpected eager tagged
+	 * send is answered NO_MATCH and dropped.
+	 *
+	 * uet_dsend_init() gates on RUD mode and on the message being at
+	 * least this size, so at the 8192 default a small tagged send can
+	 * never be deferred - and NCCL's all_reduce ring does send before
+	 * the peer has posted, which leaves the message with nowhere to go.
+	 * Setting the threshold to 0 makes every such send a rendezvous,
+	 * at the cost of an RTR token per outstanding message
+	 * (max_rtr_q_entries bounds how many a target will hold).
+	 *
+	 * Overridable so this can be tried without a rebuild.
+	 */
 	uet->msg_rndz_size = UET_MSG_RENDEZVOUS_SIZE;
 	uet->tag_rndz_size = UET_TAG_RENDEZVOUS_SIZE;
+	if (getenv("UET_MSG_RNDZ_SIZE"))
+		uet->msg_rndz_size =
+			(uint32_t)strtoul(getenv("UET_MSG_RNDZ_SIZE"),
+					  NULL, 0);
+	if (getenv("UET_TAG_RNDZ_SIZE"))
+		uet->tag_rndz_size =
+			(uint32_t)strtoul(getenv("UET_TAG_RNDZ_SIZE"),
+					  NULL, 0);
 
 	uet->pds.upcall.rx_req = uet_pds_to_ses_rx_req;
 	uet->pds.upcall.rx_rsp = uet_pds_to_ses_rx_rsp;
