@@ -5365,8 +5365,10 @@ static int uet_addr_resolution(struct uet_addr *uet_addr, uint32_t *job_id)
 		uet_addr->flags |= UET_ADDR_PID_ON_FEP_V;
 	}
 	if (!(uet_addr->flags & UET_ADDR_INDEX_V)) {
+		static uint16_t next_index = 16;
+
 		uet_addr->num_indices = 1;
-		uet_addr->start_index = UET_ADDR_DEF_INDEX;
+		uet_addr->start_index = next_index++;
 		uet_addr->flags |= UET_ADDR_INDEX_V;
 	}
 	if (!(uet_addr->flags & UET_ADDR_INITIATOR_V)) {
