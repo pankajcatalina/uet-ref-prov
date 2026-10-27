@@ -219,6 +219,9 @@ struct uet_pds_state {
 	uint32_t              new_pdc_timeout_cnt; /* PENDING PDCs reaped */
 	uint32_t              psn_range_close_cnt; /* PDCs closed PSN range */
 	uint32_t              pdc_close_in_err_cnt; /* PDCs closed in error */
+	uint64_t              tx_req_cnt;      /* transmits asked for by SES */
+	uint64_t              retransmit_cnt;  /* packets actually resent */
+	uint64_t              retry_exceeded_cnt; /* PDCs given up on */
 };
 
 static struct uet_pds_state pds_state;
@@ -1722,6 +1725,12 @@ void uet_pds_finalize(struct uet_instance *uet)
 		     pds_state.psn_range_close_cnt);
 	UET_PDS_INFO("%-30s : %u", "pdc_close_in_err_cnt",
 		     pds_state.pdc_close_in_err_cnt);
+	UET_PDS_INFO("%-30s : %llu", "tx_req_cnt",
+		     (unsigned long long)pds_state.tx_req_cnt);
+	UET_PDS_INFO("%-30s : %llu", "retransmit_cnt",
+		     (unsigned long long)pds_state.retransmit_cnt);
+	UET_PDS_INFO("%-30s : %llu", "retry_exceeded_cnt",
+		     (unsigned long long)pds_state.retry_exceeded_cnt);
 
 	/* TODO: reclaim/free all packets stored in the bitmaps... */
 
@@ -1932,6 +1941,11 @@ int uet_pds_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
 	bool mapped_msg_id = false;
 
 	PDS_GO();
+
+	/* Counted at entry rather than at the wire: this is the one place
+	 * every SES transmit enters PDS, whereas a packet may leave through
+	 * several paths below. "asked for", not "put on the wire". */
+	pds_state.tx_req_cnt++;
 
 	uet = uet_ep->uet_domain->uet;
 	av_entry = (struct uet_av_entry *)dst_addr_handle;
@@ -2374,6 +2388,7 @@ static int uet_pds_check_rtx_pkt(struct uet_instance *uet,
 		return 0; /* wait for CACK to advance the peer window */
 
 	if (pdc_pkt->tx_retry_cnt >= uet->pds.max_tx_retries) {
+		pds_state.retry_exceeded_cnt++;
 		UET_PDS_ERR("PDC %u PSN %u retry exceeded",
 			    pdc->pdc_id, pdc_pkt->psn);
 		return -EIO; /* assume this PDC is dead */
@@ -2391,6 +2406,7 @@ static int uet_pds_check_rtx_pkt(struct uet_instance *uet,
 		return -EIO; /* assume this PDC is dead */
 	}
 
+	pds_state.retransmit_cnt++;
 	return -EAGAIN; /* pkt retransmitted, could be more */
 }
 

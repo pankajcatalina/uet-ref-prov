@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <unistd.h>
 #include <linux/if_ether.h>
 
 #include "uet_pkt_hdr.h"
@@ -17,6 +18,25 @@
 #include "uet_pkt_chk.h"
 #include "uet_nic.h"
 #include "crc32c.h"
+
+/*
+ * Per-process counters, printed at finalize.
+ *
+ * SNG keeps one transmit in flight, so these are enough to tell a clean
+ * run from one that is quietly retransmitting: send should equal
+ * "ack accepted", retransmit should be zero on a healthy fabric, and a
+ * non-zero "ack dropped" means acks arrived that did not match the
+ * outstanding PSN. The format deliberately matches the counters the
+ * reference tree prints so a shim run and a native run can be diffed
+ * line for line.
+ */
+static struct {
+	uint64_t send;
+	uint64_t retransmit;
+	uint64_t ack_received;
+	uint64_t ack_accepted;
+	uint64_t ack_dropped;
+} sng_stats;
 
 /* pds transmit state */
 struct uet_pds_sng_tx_state {
@@ -601,6 +621,24 @@ int uet_pds_sng_initialize(struct uet_instance *uet)
 /* free pds resources for uet instance */
 void uet_pds_sng_finalize(struct uet_instance *uet)
 {
+	char host[64];
+
+	if (gethostname(host, sizeof(host)) != 0)
+		host[0] = '\0';
+	host[sizeof(host) - 1] = '\0';
+
+	UET_PDS_INFO("===== %s pid %d =====", host, (int)getpid());
+	UET_PDS_INFO(" %-18s %10llu", "send",
+		     (unsigned long long)sng_stats.send);
+	UET_PDS_INFO(" %-18s %10llu", "retransmit",
+		     (unsigned long long)sng_stats.retransmit);
+	UET_PDS_INFO(" %-18s %10llu", "ack received",
+		     (unsigned long long)sng_stats.ack_received);
+	UET_PDS_INFO(" %-18s %10llu", "ack accepted",
+		     (unsigned long long)sng_stats.ack_accepted);
+	UET_PDS_INFO(" %-18s %10llu", "ack dropped",
+		     (unsigned long long)sng_stats.ack_dropped);
+	UET_PDS_INFO("==============================");
 }
 
 /* init pds resources for endpoint */
@@ -812,8 +850,10 @@ int uet_pds_sng_tx_pkt(uet_pkt_handle_t tx_pkt_handle, uint64_t pkt_cnt,
 	rc = uet_nic_tx_pkt(UET_NIC(uet), uet_pkt,
 			    (uet_pkt + sizeof(struct ethhdr)),
 			    uet_pkt_len);
-	if (rc == 0)
+	if (rc == 0) {
 		pds_state->tx.tx_active = true;
+		sng_stats.send++;
+	}
 	free(uet_pkt);
 	return rc;
 }
@@ -879,6 +919,7 @@ int uet_pds_sng_progress_tx(struct uet_ep *uet_ep,
 
 	/* retransmit the packet */
 	pds_tx->retry_cnt++;
+	sng_stats.retransmit++;
 	uet_gettime(&pds_tx->start_time);
 	if (pds_tx->pkt_parms.pds_info_valid)
 		pds_info = &pds_tx->pkt_parms.pds_info;
@@ -1040,16 +1081,24 @@ int uet_pds_sng_progress_rx(struct uet_instance *uet)
 	/* process the packet */
 	if (pkt_is_ack) {
 
-		/* packet is ack => process ack */
-		if (dst_uet_ep->ep_state == UET_EP_CLOSE_WAIT)
-			goto exit;
+		sng_stats.ack_received++;
 
-		if (!uet_pds_ep_tx_active(dst_uet_ep))
+		/* packet is ack => process ack */
+		if (dst_uet_ep->ep_state == UET_EP_CLOSE_WAIT) {
+			sng_stats.ack_dropped++;
 			goto exit;
+		}
+
+		if (!uet_pds_ep_tx_active(dst_uet_ep)) {
+			sng_stats.ack_dropped++;
+			goto exit;
+		}
 
 		if (((struct uet_pds_ack *)pp.pds)->cack_psn !=
-		    htonl(pds_tx->psn))
+		    htonl(pds_tx->psn)) {
+			sng_stats.ack_dropped++;
 			goto exit;
+		}
 
 		/* upcall for ses processing */
 		rc = ses_upcall->rx_rsp(pds_tx->pkt_parms.tx_pkt_handle, &pp);
@@ -1057,6 +1106,9 @@ int uet_pds_sng_progress_rx(struct uet_instance *uet)
 			/* update seq num for transmission of next packet */
 			pds_tx->psn++;
 			pds_tx->tx_active = false;
+			sng_stats.ack_accepted++;
+		} else {
+			sng_stats.ack_dropped++;
 		}
 	} else {  /* process message packet */
 
