@@ -445,6 +445,26 @@ struct uet_prov_ep {
 	struct uet_prov_av *av;
 };
 
+/*
+ * The AV lookup is the only way the four send paths can fail before they
+ * reach uet-ref-prov, and a bare -FI_EINVAL from here is indistinguishable
+ * from one raised deeper in the stack. Say which of the three conditions
+ * fired, because they have completely different causes: no AV bound to the
+ * endpoint, an index past what this AV holds, or a slot whose uet_av_insert()
+ * failed and left used == 0.
+ */
+static void uet_prov_av_lookup_failed(const char *who, struct uet_prov_ep *uep,
+				      fi_addr_t addr)
+{
+	fprintf(stderr,
+		"[uet_prov] %s refused: ep=%p av=%p addr=%lu count=%zu used=%d\n",
+		who, (void *)uep, (void *)(uep ? uep->av : NULL),
+		(unsigned long)addr,
+		(uep && uep->av) ? uep->av->count : (size_t)0,
+		(uep && uep->av && addr < uep->av->count) ?
+			uep->av->table[addr].used : -1);
+}
+
 /* uet_prov_ep_close() -> uet_ep_close() */
 static int uet_prov_ep_close(struct fid *fid)
 {
@@ -740,8 +760,10 @@ struct uet_prov_ep *uep = container_of(ep, struct uet_prov_ep, fid);
         /* send has a destination address */
         uet_addr_handle_t dest; 
         // = (uet_addr_handle_t)(uintptr_t)dest_addr;
-        if(!uep->av || dest_addr >= uep->av->count || !uep->av->table[dest_addr].used)
+        if(!uep->av || dest_addr >= uep->av->count || !uep->av->table[dest_addr].used) {
+                uet_prov_av_lookup_failed(__func__, uep, dest_addr);
                 return -FI_EINVAL;
+        }
         dest = uep->av->table[dest_addr].handle;
 	ssize_t ret;
         return uet_send(uep->ep_handle, UET_PROV_JOB_ID_PLACEHOLDER, (void *)buf, len,
@@ -759,8 +781,10 @@ static ssize_t uet_prov_msg_sendmsg(struct fid_ep *ep, const struct fi_msg *msg,
 
         /* msg->addr is an AV index, not a handle: look it up, same as tagged_send */
         if (!uep->av || msg->addr >= uep->av->count ||
-            !uep->av->table[msg->addr].used)
+            !uep->av->table[msg->addr].used) {
+                uet_prov_av_lookup_failed(__func__, uep, msg->addr);
                 return -FI_EINVAL;
+        }
         dest = uep->av->table[msg->addr].handle;
 
         /* uet_sendmsg() in uet-ref-prov is only a stub (returns -FI_ENOSYS),
@@ -818,8 +842,10 @@ static ssize_t uet_prov_tagged_send(struct fid_ep *ep, const void *buf, size_t l
 	struct iovec iov;
 
         // = (uet_addr_handle_t)(uintptr_t)dest_addr;
-        if(!uep->av || dest_addr >= uep->av->count || !uep->av->table[dest_addr].used)
+        if(!uep->av || dest_addr >= uep->av->count || !uep->av->table[dest_addr].used) {
+                uet_prov_av_lookup_failed(__func__, uep, dest_addr);
                 return -FI_EINVAL;
+        }
         dest = uep->av->table[dest_addr].handle;
 //	if(first_send_count<4){
 //		first_send_count++;
@@ -855,8 +881,10 @@ static ssize_t uet_prov_tagged_sendmsg(struct fid_ep *ep, const struct fi_msg_ta
 
 	/* msg->addr is an AV index, not a handle: look it up, same as tagged_send */
 	if (!uep->av || msg->addr >= uep->av->count ||
-	    !uep->av->table[msg->addr].used)
+	    !uep->av->table[msg->addr].used) {
+		uet_prov_av_lookup_failed(__func__, uep, msg->addr);
 		return -FI_EINVAL;
+	}
 	dest = uep->av->table[msg->addr].handle;
 
 	/* uet_tsendmsg() in uet-ref-prov is only a stub (returns -FI_ENOSYS),
