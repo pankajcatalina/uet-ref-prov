@@ -565,9 +565,25 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		}
 		memcpy(a, g_in, sizeof(*a));
 
+		/*
+		 * The peer's address decides which of its endpoints an
+		 * outbound packet is demuxed to, by {ip, pid_on_fep, index}.
+		 * Print the index alongside the handle the sender will use,
+		 * so an AV entry pointing at the wrong endpoint is visible:
+		 * that produces a tagged message arriving where no tagged
+		 * receive is posted, which reads as "Unexpected Tagged
+		 * Message" with a perfectly matching tag.
+		 */
 		rsp->ret = uet_av_insert(hdl_get(req->h1), a, &ah);
 		if (rsp->ret == 0) {
 			rsp->h2 = hdl_put(ah);
+			LOG("AV_INSERT    -> handle=%llu pid_on_fep=%u "
+			    "start_index=%u num_indices=%u initiator=%u\n",
+			    (unsigned long long)rsp->h2,
+			    (unsigned)a->pid_on_fep,
+			    (unsigned)a->start_index,
+			    (unsigned)a->num_indices,
+			    (unsigned)a->initiator_id);
 			if (rsp->h2 < HDL_MAX)
 				av_addr[rsp->h2] = a;
 			else
