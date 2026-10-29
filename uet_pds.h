@@ -18,6 +18,8 @@
 #include "uet_util.h"
 
 #define UET_PDS "UET_PDS"
+/* rod|rud: override the mode tx_attr->msg_order would select */
+#define UET_FORCE_MODE "UET_FORCE_MODE"
 
 #define UET_DEFAULT_TX_TIMEOUT       5		/* in millisecs */
 #define UET_DEFAULT_MAX_TX_RETRIES   5

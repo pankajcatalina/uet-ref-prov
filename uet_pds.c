@@ -228,6 +228,9 @@ struct uet_pds_state {
 	uint64_t              ack_accept_cnt;  /* acks that retired a packet */
 	uint64_t              ack_dup_cnt;     /* acks for an already-acked PSN */
 	uint64_t              ack_drop_cnt;    /* acks discarded as invalid */
+	uint64_t              pdc_ini_cnt;     /* initiator PDCs opened (SYN) */
+	uint64_t              pdc_tgt_cnt;     /* target PDCs opened */
+	uint64_t              pdc_est_cnt;     /* PDCs that reached ESTABLISHED */
 };
 
 static struct uet_pds_state pds_state;
@@ -954,6 +957,7 @@ static struct uet_pdc *uet_pdsm_assign_ini_pdc(struct uet_ep *uet_ep,
 	}
 
 	/* initialze this initiator PDC */
+	pds_state.pdc_ini_cnt++;
 	uet_init_pdc(pdc, PDC_STATE_SYN, true);
 
 	memcpy(pdc->src_mac_addr, uet_ep->uet_domain->uet->nic.mac_addr,
@@ -1116,6 +1120,8 @@ static int uet_pdsm_assign_tgt_pdc(struct uet_parsed_pkt *pp,
 	}
 
 	/* initialze this target PDC */
+	pds_state.pdc_tgt_cnt++;
+	pds_state.pdc_est_cnt++;
 	uet_init_pdc(pdc, PDC_STATE_ESTABLISHED, false);
 
 	memcpy(pdc->src_mac_addr, eth->h_dest, ETH_ALEN);
@@ -1782,6 +1788,85 @@ int uet_pds_initialize(struct uet_instance *uet)
 	return 0;
 }
 
+/*
+ * Dumped from a library destructor rather than from uet_pds_finalize(),
+ * because a run that is killed - a hung collective, a timeout - never
+ * reaches finalize, and those are exactly the runs whose counters matter.
+ * An NCCL job also creates a throwaway instance for fi_getinfo() before
+ * the real one, so printing per finalize gave the empty instance's zeros
+ * as the last block in the log.
+ *
+ * Silent when this backend was never used, so an sng run prints only the
+ * sng block.
+ */
+static void pds_stats_dump(void)
+{
+	static bool dumped;
+
+	if (dumped)
+		return;
+	dumped = true;
+
+	if ((pds_state.tx_pkt_cnt | pds_state.ack_rx_cnt |
+	     pds_state.pdc_ini_cnt | pds_state.pdc_tgt_cnt) == 0)
+		return;
+
+	/* PDS health stats: DoS-reaped PENDING PDCs + PSN-range-driven closes */
+		UET_PDS_INFO("%-30s : %u", "new_pdc_timeout_cnt",
+			     pds_state.new_pdc_timeout_cnt);
+		UET_PDS_INFO("%-30s : %u", "psn_range_close_cnt",
+			     pds_state.psn_range_close_cnt);
+		UET_PDS_INFO("%-30s : %u", "pdc_close_in_err_cnt",
+			     pds_state.pdc_close_in_err_cnt);
+
+		/* Same shape as the SNG block so a pds run and an sng run line up.
+		 * "ack duplicate" has no SNG equivalent: PDS reorders and coalesces
+		 * acks, so an ack for an already-retired PSN is normal rather than a
+		 * fault, and folding it into "dropped" would misread a healthy run. */
+		{
+			char host[64];
+
+			if (gethostname(host, sizeof(host)) != 0)
+				host[0] = '\0';
+			host[sizeof(host) - 1] = '\0';
+			UET_PDS_INFO("===== %s pid %d =====", host, (int)getpid());
+		}
+		UET_PDS_INFO(" %-18s %10llu", "send",
+			     (unsigned long long)pds_state.tx_pkt_cnt);
+		UET_PDS_INFO(" %-18s %10llu", "retransmit",
+			     (unsigned long long)pds_state.retransmit_cnt);
+		UET_PDS_INFO(" %-18s %10llu", "nack sent",
+			     (unsigned long long)pds_state.tx_nack_cnt);
+		UET_PDS_INFO(" %-18s %10llu", "ack sent",
+			     (unsigned long long)pds_state.tx_ack_cnt);
+		UET_PDS_INFO(" %-18s %10llu", "ack received",
+			     (unsigned long long)pds_state.ack_rx_cnt);
+		UET_PDS_INFO(" %-18s %10llu", "ack accepted",
+			     (unsigned long long)pds_state.ack_accept_cnt);
+		UET_PDS_INFO(" %-18s %10llu", "ack duplicate",
+			     (unsigned long long)pds_state.ack_dup_cnt);
+		UET_PDS_INFO(" %-18s %10llu", "ack dropped",
+			     (unsigned long long)pds_state.ack_drop_cnt);
+		UET_PDS_INFO(" %-18s %10llu", "retry exceeded",
+			     (unsigned long long)pds_state.retry_exceeded_cnt);
+		UET_PDS_INFO("==============================");
+	UET_PDS_INFO(" %-18s %10llu", "pdc opened",
+		     (unsigned long long)(pds_state.pdc_ini_cnt +
+					  pds_state.pdc_tgt_cnt));
+	UET_PDS_INFO(" %-18s %10llu", "pdc established",
+		     (unsigned long long)pds_state.pdc_est_cnt);
+	if (((pds_state.pdc_ini_cnt + pds_state.pdc_tgt_cnt) > 0) &&
+	    (pds_state.pdc_est_cnt == 0))
+		UET_PDS_INFO("NOTE: no PDC reached ESTABLISHED; the SYN "
+			     "handshake never completed");
+	UET_PDS_INFO("==============================");
+}
+
+static __attribute__((destructor)) void pds_stats_at_exit(void)
+{
+	pds_stats_dump();
+}
+
 void uet_pds_finalize(struct uet_instance *uet)
 {
 	struct uet_pdc *pdc;
@@ -1789,45 +1874,7 @@ void uet_pds_finalize(struct uet_instance *uet)
 
 	PDS_GO();
 
-	/* PDS health stats: DoS-reaped PENDING PDCs + PSN-range-driven closes */
-	UET_PDS_INFO("%-30s : %u", "new_pdc_timeout_cnt",
-		     pds_state.new_pdc_timeout_cnt);
-	UET_PDS_INFO("%-30s : %u", "psn_range_close_cnt",
-		     pds_state.psn_range_close_cnt);
-	UET_PDS_INFO("%-30s : %u", "pdc_close_in_err_cnt",
-		     pds_state.pdc_close_in_err_cnt);
-
-	/* Same shape as the SNG block so a pds run and an sng run line up.
-	 * "ack duplicate" has no SNG equivalent: PDS reorders and coalesces
-	 * acks, so an ack for an already-retired PSN is normal rather than a
-	 * fault, and folding it into "dropped" would misread a healthy run. */
-	{
-		char host[64];
-
-		if (gethostname(host, sizeof(host)) != 0)
-			host[0] = '\0';
-		host[sizeof(host) - 1] = '\0';
-		UET_PDS_INFO("===== %s pid %d =====", host, (int)getpid());
-	}
-	UET_PDS_INFO(" %-18s %10llu", "send",
-		     (unsigned long long)pds_state.tx_pkt_cnt);
-	UET_PDS_INFO(" %-18s %10llu", "retransmit",
-		     (unsigned long long)pds_state.retransmit_cnt);
-	UET_PDS_INFO(" %-18s %10llu", "nack sent",
-		     (unsigned long long)pds_state.tx_nack_cnt);
-	UET_PDS_INFO(" %-18s %10llu", "ack sent",
-		     (unsigned long long)pds_state.tx_ack_cnt);
-	UET_PDS_INFO(" %-18s %10llu", "ack received",
-		     (unsigned long long)pds_state.ack_rx_cnt);
-	UET_PDS_INFO(" %-18s %10llu", "ack accepted",
-		     (unsigned long long)pds_state.ack_accept_cnt);
-	UET_PDS_INFO(" %-18s %10llu", "ack duplicate",
-		     (unsigned long long)pds_state.ack_dup_cnt);
-	UET_PDS_INFO(" %-18s %10llu", "ack dropped",
-		     (unsigned long long)pds_state.ack_drop_cnt);
-	UET_PDS_INFO(" %-18s %10llu", "retry exceeded",
-		     (unsigned long long)pds_state.retry_exceeded_cnt);
-	UET_PDS_INFO("==============================");
+	pds_stats_dump();
 
 	/* TODO: reclaim/free all packets stored in the bitmaps... */
 

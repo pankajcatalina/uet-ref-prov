@@ -120,6 +120,41 @@ static void uet_init_uet_addr(struct uet_addr *uet_addr,
 /* get pds mode for an endpoint */
 static uet_pds_mode_t uet_get_pds_mode(struct uet_ep *uet_ep, bool rma_op)
 {
+	/*
+	 * UET_FORCE_MODE=rod|rud overrides what msg_order would select.
+	 *
+	 * The mode decides two things that matter a long way from here: ROD
+	 * disables the deferred-send path entirely (uet_dsend_init() returns
+	 * early unless RUD), and it turns a tagged NO_MATCH into
+	 * tagged_gen_disabled, which poisons the endpoint rather than
+	 * letting a retry succeed. Overriding it here leaves the provider's
+	 * advertised msg_order honest, which editing tx_attr does not.
+	 *
+	 * Resolved once: this is called on every send.
+	 */
+	static uet_pds_mode_t forced;
+	static bool force_valid, resolved;
+
+	if (!resolved) {
+		const char *s = getenv(UET_FORCE_MODE);
+
+		if (s != NULL) {
+			if (strcmp(s, "rod") == 0) {
+				forced = UET_PDS_MODE_ROD;
+				force_valid = true;
+			} else if (strcmp(s, "rud") == 0) {
+				forced = UET_PDS_MODE_RUD;
+				force_valid = true;
+			} else
+				UET_API_ERR("invalid %s, expected rod|rud",
+					    UET_FORCE_MODE);
+		}
+		resolved = true;
+	}
+
+	if (force_valid)
+		return forced;
+
 	if (uet_ep->info->tx_attr->msg_order & UET_ORDERING)
 			return UET_PDS_MODE_ROD;
 

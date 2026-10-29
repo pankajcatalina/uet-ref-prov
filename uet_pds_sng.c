@@ -619,10 +619,25 @@ int uet_pds_sng_initialize(struct uet_instance *uet)
 	return 0;
 }
 
-/* free pds resources for uet instance */
-void uet_pds_sng_finalize(struct uet_instance *uet)
+/*
+ * Dumped from a library destructor rather than from the finalize call, for
+ * the same reason as the pds backend: a killed run never reaches finalize,
+ * and an NCCL job's throwaway fi_getinfo() instance would otherwise leave
+ * its empty block as the last one in the log.
+ *
+ * Silent when this backend was never used.
+ */
+static void sng_stats_dump(void)
 {
+	static bool dumped;
 	char host[64];
+
+	if (dumped)
+		return;
+	dumped = true;
+
+	if ((sng_stats.send | sng_stats.ack_received) == 0)
+		return;
 
 	if (gethostname(host, sizeof(host)) != 0)
 		host[0] = '\0';
@@ -640,6 +655,17 @@ void uet_pds_sng_finalize(struct uet_instance *uet)
 	UET_PDS_INFO(" %-18s %10llu", "ack dropped",
 		     (unsigned long long)sng_stats.ack_dropped);
 	UET_PDS_INFO("==============================");
+}
+
+static __attribute__((destructor)) void sng_stats_at_exit(void)
+{
+	sng_stats_dump();
+}
+
+/* free pds resources for uet instance */
+void uet_pds_sng_finalize(struct uet_instance *uet)
+{
+	sng_stats_dump();
 }
 
 /* init pds resources for endpoint */
