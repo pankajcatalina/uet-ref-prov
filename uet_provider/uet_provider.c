@@ -349,7 +349,14 @@ static int uet_prov_av_insert(struct fid_av *av_fid, const void *addr,
 			continue;
 		}
 
-		idx = av->count++;			
+		/*
+		 * Take the slot without counting it yet. av->count is what
+		 * every bounds check reads, so bumping it before the entry
+		 * exists publishes a half-built slot - and on the
+		 * uet_av_insert() failure path just below it would leave a
+		 * dead one behind for good.
+		 */
+		idx = av->count;
 		e = &av->table[idx];
 		e->addr = addrs[i];			
 
@@ -360,6 +367,7 @@ static int uet_prov_av_insert(struct fid_av *av_fid, const void *addr,
 		}
 
 		e->used = 1;
+		av->count++;			/* publish: the entry is real */
 		if (fi_addr)
 			fi_addr[i] = idx;		
 		inserted++;
@@ -748,19 +756,27 @@ static ssize_t uet_prov_msg_recv(struct fid_ep *ep, void *buf, size_t len, void 
 	struct uet_prov_ep *uep = container_of(ep, struct uet_prov_ep, fid);
 	uet_addr_handle_t src;
 	/* doesn't know who is sending yet, so accept from any src.*/
-	if(src_addr == FI_ADDR_UNSPEC){
-//		fprintf(stderr, "DEBUG WILDCARD CHECK: av=%p count=%zu table0_used=%d\n",
-//		(void *)uep->av,
-//		uep->av ? uep->av->count : 0,
-//		(uep->av && uep->av->count > 0) ? uep->av->table[0].used : -1);
-		if(uep->av && uep->av->count>0 && uep->av->table[0].used){
-			src = uep->av->table[0].handle;
-		}else{
-			src=UET_NULL_HANDLE;
-		}
-	}else{
-	/*App gives a real peer address, convert it back to real pointer. */
-		src = (uet_addr_handle_t)(uintptr_t)src_addr;
+	/*
+	 * fi_av_insert() hands libfabric an INDEX, not a pointer, so a real
+	 * address has to be resolved through the table. Casting it appeared
+	 * to work only because index 0 equals UET_NULL_HANDLE, which the
+	 * stack reads as "any source": the first peer behaved correctly and
+	 * every later one did not.
+	 *
+	 * FI_ADDR_UNSPEC means ANY source and must not be narrowed to
+	 * table[0] - that silently restricts a wildcard receive to one peer.
+	 * src_addr 0 against an empty AV is the same request, made before
+	 * anything was inserted.
+	 */
+	if (src_addr == FI_ADDR_UNSPEC ||
+	    (src_addr == 0 && (!uep->av || uep->av->count == 0))) {
+		src = UET_NULL_HANDLE;
+	} else if (uep->av && src_addr < uep->av->count &&
+		   uep->av->table[src_addr].used) {
+		src = uep->av->table[src_addr].handle;
+	} else {
+		uet_prov_av_lookup_failed(__func__, uep, src_addr);
+		return -FI_EINVAL;
 	}
 	return uet_recv(uep->ep_handle, UET_JOB_ID_ANY, buf, len,
 					(uet_mr_handle_t)desc, src, context);
@@ -818,15 +834,27 @@ static ssize_t uet_prov_tagged_recv(struct fid_ep *ep, void *buf, size_t len, vo
 	uet_addr_handle_t src;
 	struct iovec iov;
 	/* doesn't know who is sending yet, so accept from any src.*/
-        if(src_addr == FI_ADDR_UNSPEC){
-                if(uep->av && uep->av->count>0 && uep->av->table[0].used){
-                        src = uep->av->table[0].handle;
-                }else{
-                        src=UET_NULL_HANDLE;
-		}
-        }else{
-        /*App gives a real peer address, convert it back to real pointer. */
-                src = (uet_addr_handle_t)(uintptr_t)src_addr;
+	/*
+	 * fi_av_insert() hands libfabric an INDEX, not a pointer, so a real
+	 * address has to be resolved through the table. Casting it appeared
+	 * to work only because index 0 equals UET_NULL_HANDLE, which the
+	 * stack reads as "any source": the first peer behaved correctly and
+	 * every later one did not.
+	 *
+	 * FI_ADDR_UNSPEC means ANY source and must not be narrowed to
+	 * table[0] - that silently restricts a wildcard receive to one peer.
+	 * src_addr 0 against an empty AV is the same request, made before
+	 * anything was inserted.
+	 */
+	if (src_addr == FI_ADDR_UNSPEC ||
+	    (src_addr == 0 && (!uep->av || uep->av->count == 0))) {
+		src = UET_NULL_HANDLE;
+	} else if (uep->av && src_addr < uep->av->count &&
+		   uep->av->table[src_addr].used) {
+		src = uep->av->table[src_addr].handle;
+	} else {
+		uet_prov_av_lookup_failed(__func__, uep, src_addr);
+		return -FI_EINVAL;
 	}
 //	fprintf(stderr,
 //        "UET BRIDGE TRECV: ep=%p src=%p tag=0x%lx ignore=0x%lx len=%zu ctx=%p\n",
