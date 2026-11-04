@@ -143,10 +143,23 @@ static int shim_connect_once(void)
  */
 static void reap_posted(const struct shim_hdr *rsp)
 {
-	if (g_outstanding > 0)
-		g_outstanding--;
-
+	/*
+	 * A reply means the guest ACCEPTED the operation - the work request
+	 * is in the device queue - not that it finished. The credit belongs
+	 * to the completion, and is returned in uet_cq_read().
+	 *
+	 * Returning it here instead bounded only the number of un-replied
+	 * posts. Incomplete operations could then accumulate without limit
+	 * in a device queue that is deep but finite, and when that filled,
+	 * the post the host had already reported as FI_SUCCESS would be
+	 * refused with -FI_EAGAIN and silently lost.
+	 *
+	 * A failed post is the exception: there will be no completion for
+	 * it, so its credit has to come back here or it is gone for good.
+	 */
 	if (rsp->ret < 0) {
+		if (g_outstanding > 0)
+			g_outstanding--;
 		g_post_errors++;
 		fprintf(stderr, "[shim/host] POSTED %s (seq %u) failed after "
 			"the application was told it was queued: %lld "
@@ -974,6 +987,56 @@ static uint64_t shim_global_rank(void)
 	return rank;
 }
 
+/*
+ * Give this endpoint an Initiator ID that is unique across the job.
+ *
+ *     initiator = rank * 256 + ep_seq + 1
+ *
+ * The spec asks only that it be unique among the senders a receiver can
+ * see in one job (UE 1.1 2.2.4.2). It is per ENDPOINT, not per rank,
+ * because NCCL opens several per rank, and the +1 is because the driver
+ * rejects 0.
+ *
+ * It travels in the uet_addr inside shim_fi_info.src_addr, which is the
+ * spec's own field for it (Table 2-10) and already crosses unchanged - so
+ * no opcode, no argument and no ABI version has to move, and the guest
+ * does nothing. libuet reads it when UET_ADDR_INITIATOR_V is set and the
+ * value is non-zero, falling back to UET_PROVIDER_INITIATOR_ID otherwise,
+ * which is what keeps in-VM fabtests working.
+ *
+ * Patched into the FLATTENED copy, never into the caller's fi_info: that
+ * struct belongs to libfabric and the provider retains it by pointer.
+ *
+ * Without a rank from the launcher we leave the address alone rather than
+ * inventing one, because a guessed ID that collides is worse than the
+ * env fallback.
+ */
+static void shim_set_initiator(struct shim_fi_info *flat)
+{
+	static uint32_t ep_seq;
+	struct uet_addr *a;
+	uint64_t rank = shim_global_rank();
+
+	if (rank == SHIM_RANK_UNKNOWN)
+		return;
+	if (flat->src_addrlen < sizeof(*a))
+		return;
+
+	a = (struct uet_addr *)flat->src_addr;
+	a->initiator_id = (uint32_t)(rank * 256u + (ep_seq & 0xff) + 1u);
+	a->flags |= UET_ADDR_INITIATOR_V;
+
+	fprintf(stderr, "[shim/host] endpoint %u: initiator %u "
+		"(rank %llu x 256 + %u + 1)\n",
+		ep_seq, a->initiator_id, (unsigned long long)rank,
+		ep_seq & 0xff);
+
+	if (++ep_seq == 256)
+		fprintf(stderr, "[shim/host] WARNING: 256 endpoints on this "
+			"rank; ep_seq wraps and Initiator IDs will now "
+			"collide with the next rank\n");
+}
+
 int uet_endpoint(uet_domain_handle_t domain_handle,
 		 struct fi_info *info, struct fid_ep *ep,
 		 void *context, uet_ep_handle_t *ep_handle)
@@ -987,6 +1050,7 @@ int uet_endpoint(uet_domain_handle_t domain_handle,
 	h.a4 = shim_global_rank();
 
 	shim_info_flatten(info, &flat);
+	shim_set_initiator(&flat);
 
 	rc = shim_rpc(SHIM_ENDPOINT, &h, &flat, sizeof(flat), NULL, 0, NULL);
 	if (rc < 0)
@@ -1323,6 +1387,12 @@ ssize_t uet_cq_read(uet_cq_handle_t cq_handle, void *buf, size_t count)
 			if (src != NULL)
 				memcpy(ce.b_user, src, ce.b_len);
 		}
+
+		/* The operation is over, so its credit comes back here - see
+		 * reap_posted(). This is what bounds work in flight BELOW,
+		 * rather than merely bounding un-replied posts. */
+		if (g_outstanding > 0)
+			g_outstanding--;
 
 		/* A transient block lives exactly as long as its operation.
 		 * This is the line that makes the ABI 1 send-buffer hazard

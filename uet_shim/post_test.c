@@ -126,21 +126,35 @@ int main(void)
 	      "outstanding accounting matches what was posted (%u = %u + %u)",
 	      shim_host_outstanding(), base, posted);
 
-	/* 2. one synchronous RPC must retire every posted reply on its way
-	 *    to its own - this is what keeps the g2h ring from filling. */
+	/*
+	 * 2. One synchronous RPC must retire every posted REPLY on its way
+	 *    to its own - this is what keeps the g2h ring from filling.
+	 */
 	before = shim_host_outstanding();
 	(void)uet_progress(FAKE_DOM);
 
 	CHECK(before > 1, "there were %u replies waiting to be reaped",
 	      before);
-	CHECK(shim_host_outstanding() == 0,
-	      "one RPC drained them all (now %u)",
+
+	/*
+	 * 3. ...but the CREDITS must NOT come back, because a reply only
+	 *    says the guest accepted the work request into the device
+	 *    queue. The credit belongs to the completion.
+	 *
+	 *    Returning it on the reply bounded only un-replied posts, and
+	 *    let incomplete operations pile up without limit in a device
+	 *    queue that is deep but finite. When that filled, a post the
+	 *    application had already been told succeeded would be refused
+	 *    and lost.
+	 */
+	CHECK(shim_host_outstanding() == before,
+	      "draining replies does NOT return credits (%u, still)",
 	      shim_host_outstanding());
 
-	/* 3. and the credits come back */
 	rc = uet_tsendv(FAKE_EP, 1, &iov, 1, FAKE_MR, FAKE_AV, 0x1234,
 			(void *)(uintptr_t)0xbeef);
-	CHECK(rc == 0, "credits recovered, posting works again (got %zd)",
+	CHECK(rc == -FI_EAGAIN,
+	      "and the cap still holds until completions are read (got %zd)",
 	      rc);
 
 	printf("\n%s (%d failure%s)\n", fails ? "FAILED" : "all passed",
