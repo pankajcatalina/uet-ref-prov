@@ -193,6 +193,61 @@ static int64_t shim_rpc(uint32_t op, struct shim_hdr *h,
 			uint32_t *reply_len);
 
 /*
+ * One line per operation, for the container side.
+ *
+ * Both paths log through this. shim_post() needs it as much as
+ * shim_rpc() does - more, in fact: ABI 6 made the eight data-path calls
+ * asynchronous, and until this existed they vanished from the host log
+ * entirely. Every TSENDV and TRECVV a run issued was invisible on the
+ * side that issued them, while the guest still printed them.
+ *
+ * tag and ignore ride in the payload rather than in a1..a4, so they are
+ * decoded here. `ignore` earns its place: it is the one argument the
+ * stack refuses outright, since anything but UET_EXACT_MATCH is
+ * -FI_EINVAL, "Wildcard Tags Not Supported". Seeing it on this side
+ * says whether the provider asked for wildcard bits or the stack
+ * invented the refusal.
+ */
+static int shim_trace(void);
+
+struct shim_argsnap {
+	uint64_t h1, h2, off, a1, a2, a3, a4;
+};
+
+static void shim_argsnap(struct shim_argsnap *o, const struct shim_hdr *h)
+{
+	o->h1 = h->h1; o->h2 = h->h2; o->off = h->off;
+	o->a1 = h->a1; o->a2 = h->a2; o->a3 = h->a3; o->a4 = h->a4;
+}
+
+static void shim_trace_op(uint32_t op, int64_t ret,
+			  const struct shim_argsnap *q,
+			  const void *in, uint32_t in_len)
+{
+	char tg[64] = "";
+
+	if ((ret >= 0) && !shim_trace())
+		return;
+
+	if (shim_op_has_tag_args(op) && (in != NULL) &&
+	    (in_len >= sizeof(struct shim_tag_args))) {
+		const struct shim_tag_args *ta = in;
+
+		snprintf(tg, sizeof(tg), " tag=0x%016llx ignore=0x%016llx",
+			 (unsigned long long)ta->tag,
+			 (unsigned long long)ta->ignore);
+	}
+
+	fprintf(stderr, "[shim/host] %-12s -> %lld  h1=%llu h2=%llu "
+		"off=%llu a1=%llu a2=%llu a3=%llu a4=%llu%s\n",
+		shim_op_name(op), (long long)ret,
+		(unsigned long long)q->h1, (unsigned long long)q->h2,
+		(unsigned long long)q->off,
+		(unsigned long long)q->a1, (unsigned long long)q->a2,
+		(unsigned long long)q->a3, (unsigned long long)q->a4, tg);
+}
+
+/*
  * Kill switch. Asynchronous posting is the one change in ABI 6 that alters
  * WHEN things happen rather than only how they are carried, so it can be
  * turned off at run time: set UET_SHIM_SYNC=1 and every data-path call
@@ -220,6 +275,7 @@ static int shim_sync_mode(void)
 static int64_t shim_post(uint32_t op, struct shim_hdr *h,
 			 const void *in, uint32_t in_len)
 {
+	struct shim_argsnap snap;
 	int rc;
 
 	if (shim_sync_mode())
@@ -243,6 +299,7 @@ static int64_t shim_post(uint32_t op, struct shim_hdr *h,
 	h->op = op;
 	h->payload_len = in_len;
 	h->seq = ++g_seq;
+	shim_argsnap(&snap, h);
 
 	rc = shim_send_msg(g_fd, h, in);
 	if (rc == -EAGAIN) {
@@ -262,6 +319,9 @@ static int64_t shim_post(uint32_t op, struct shim_hdr *h,
 
 	g_outstanding++;
 	pthread_mutex_unlock(&g_lock);
+
+	/* FI_SUCCESS means QUEUED here, so the line says posted, not done */
+	shim_trace_op(op, FI_SUCCESS, &snap, in, in_len);
 	return FI_SUCCESS;
 }
 
@@ -596,8 +656,7 @@ static int64_t shim_rpc(uint32_t op, struct shim_hdr *h,
 	/* the request's own arguments: shim_rpc() hands the REPLY back
 	 * through *h, so by the time there is a result to report these are
 	 * gone. Snapshot them while they still mean something. */
-	const uint64_t q1 = h->a1, q2 = h->a2, q3 = h->a3, q4 = h->a4;
-	const uint64_t qh1 = h->h1, qh2 = h->h2, qoff = h->off;
+	struct shim_argsnap snap;
 	int rc;
 
 	/*
@@ -619,6 +678,7 @@ static int64_t shim_rpc(uint32_t op, struct shim_hdr *h,
 	h->op = op;
 	h->payload_len = in_len;
 	h->seq = ++g_seq;
+	shim_argsnap(&snap, h);
 
 	rc = shim_send_msg(g_fd, h, in);
 	if (rc != 0)
@@ -673,14 +733,7 @@ static int64_t shim_rpc(uint32_t op, struct shim_hdr *h,
 	h->a1 = rsp.a1;
 	h->a2 = rsp.a2;
 
-	if ((rsp.ret < 0) || shim_trace())
-		fprintf(stderr, "[shim/host] %-12s -> %lld  h1=%llu h2=%llu "
-			"off=%llu a1=%llu a2=%llu a3=%llu a4=%llu\n",
-			shim_op_name(op), (long long)rsp.ret,
-			(unsigned long long)qh1, (unsigned long long)qh2,
-			(unsigned long long)qoff,
-			(unsigned long long)q1, (unsigned long long)q2,
-			(unsigned long long)q3, (unsigned long long)q4);
+	shim_trace_op(op, rsp.ret, &snap, in, in_len);
 
 	pthread_mutex_unlock(&g_lock);
 	return rsp.ret;

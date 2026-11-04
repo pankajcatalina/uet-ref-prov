@@ -239,6 +239,14 @@ enum shim_op {
 #define SHIM_ARENA_M_H     SHIM_ARENA_BIT(SHIM_REG_ARENA_H)
 #define SHIM_ARENA_M_G     SHIM_ARENA_BIT(SHIM_REG_ARENA_G)
 
+/* Which opcodes prefix their payload with struct shim_tag_args. Kept
+ * beside the IDL that says so, rather than as a list in one .c file. */
+static inline int shim_op_has_tag_args(uint32_t op)
+{
+	return (op == SHIM_TSEND) || (op == SHIM_TSENDV) ||
+	       (op == SHIM_TRECV) || (op == SHIM_TRECVV);
+}
+
 static inline unsigned shim_op_arena_mask(uint32_t op)
 {
 	switch (op) {
