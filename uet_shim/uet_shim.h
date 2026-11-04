@@ -31,8 +31,78 @@
  * side's dependencies in scope.
  */
 
-#define SHIM_ABI_VERSION   4u            /* bump on ANY change below */
+#define SHIM_ABI_VERSION   6u            /* bump on ANY change below */
 #define SHIM_MAGIC         0x53484d31u   /* "SHM1", in every message */
+
+/* ---------------------------------------------------------------- regions
+ * ABI 4 had ONE region holding the mailboxes and a single arena. Three
+ * things forced the split:
+ *
+ *   - one allocator served both directions, so a receive landing zone was
+ *     allocated by the side that does not write it;
+ *   - the channel (tiny, hot, both CPUs hammering one cache line) shared a
+ *     mapping with the arena (bulk, streamed, touched once);
+ *   - control traffic and bulk payloads shared one mailbox pair, so a
+ *     256 KiB send blocked a completion poll behind it.
+ *
+ * Each region is a separate backing file and a separate ivshmem BAR, and
+ * each announces itself with its own magic. The guest therefore DISCOVERS
+ * the regions by content rather than trusting PCI enumeration order, which
+ * shifts with machine type and with the order of -device arguments.
+ *
+ * The invariant that survives the split is SINGLE ALLOCATOR, not single
+ * writer: an MR's bytes are written by the host (seeding a registration)
+ * AND by the guest's stack (an inbound RMA write), and that is the point of
+ * an MR. What each region has is exactly one free list with one owner, so
+ * there is no cross-side locking and a crashed peer corrupts only its own.
+ */
+enum shim_region {
+	SHIM_REG_CTRL = 0,       /* mailboxes + handshake; no arena       */
+	SHIM_REG_ARENA_H,        /* host allocates: MRs, tx staging       */
+	SHIM_REG_ARENA_G,        /* guest allocates: rx landing, replies  */
+	SHIM_REG_MAX
+};
+
+/* Read as big-endian ASCII: "UETC", "UETH", "UETG". Stored little-endian,
+ * so a hexdump of the region shows them reversed - look for "CTEU". */
+#define SHIM_MAGIC_CTRL    0x55455443u
+#define SHIM_MAGIC_ARENA_H 0x55455448u
+#define SHIM_MAGIC_ARENA_G 0x55455447u
+
+/*
+ * Published at offset 0 of every region, with magic written LAST under a
+ * release store: whoever sees the magic is guaranteed to see the rest.
+ *
+ * session exists only because there are now three regions. They are files
+ * in /dev/shm and nothing zeroes them when a process dies, so a host that
+ * restarts while the guest keeps running can find CTRL from one run beside
+ * an arena from another - every magic matching, every abi matching, and
+ * every offset stale. The guest stamps one nonce into all three; the host
+ * checks that all three agree.
+ */
+struct shm_region_hdr {
+	uint32_t magic;          /* per-region, published LAST            */
+	uint32_t abi;            /* SHIM_ABI_VERSION, same in all three   */
+	uint64_t session;        /* one nonce per guest run, all regions  */
+	uint64_t region_bytes;   /* so a size mismatch is caught here too */
+};
+
+/*
+ * hdr.off now names a region as well as a byte. Three bits of tag and 61
+ * of offset keeps struct shim_hdr at exactly 80 bytes, so the IDL below and
+ * its static assertions are unchanged in shape; 61 bits addresses 2 EiB,
+ * which is not a constraint against regions of a few hundred MiB.
+ *
+ * A tagged offset of ZERO is still "no buffer" - test the whole word before
+ * decoding. It cannot collide with a real block: region 0 is CTRL, which
+ * has no arena, and an arena never hands out its first byte anyway.
+ */
+#define SHIM_OFF_SHIFT     61
+#define SHIM_OFF_VMASK     ((uint64_t)((1ULL << SHIM_OFF_SHIFT) - 1ULL))
+#define SHIM_OFF(reg, o)   ((((uint64_t)(reg)) << SHIM_OFF_SHIFT) | \
+			    ((uint64_t)(o) & SHIM_OFF_VMASK))
+#define SHIM_OFF_REG(t)    ((unsigned)((t) >> SHIM_OFF_SHIFT))
+#define SHIM_OFF_VAL(t)    ((t) & SHIM_OFF_VMASK)
 
 /*
  * Two ways for bulk data to cross, and the difference matters:
@@ -54,7 +124,15 @@
  * hdr.off carries the arena offset. Zero means "not in the arena", so the
  * first arena byte is never handed out.
  */
-#define SHIM_MAX_PAYLOAD   (256u * 1024u)
+/*
+ * The largest INLINE payload. 256 KiB in ABI 1, when bulk data had no other
+ * way across; since ABI 2 every bulk buffer goes through an arena and the
+ * mailbox carries only control structures. The real maximum in use is
+ * sizeof(struct shim_fi_info) = 1072, so 1952 leaves room to grow while
+ * keeping a ring slot at 2 KiB - which is what makes a 256-deep ring fit
+ * in the control region at all.
+ */
+#define SHIM_MAX_PAYLOAD   1952u
 #define SHIM_ARENA_ALIGN   64u           /* cache line, so two blocks in
                                           * flight never false-share */
 /*
@@ -141,6 +219,49 @@ enum shim_op {
 
 	SHIM_OP_MAX
 };
+
+/*
+ * Which arena may an operation's hdr.off name?
+ *
+ * A bitmask rather than a single region, because a receive legitimately
+ * uses either: stage_rx() and stage_iov() ask mr_off_for() first, so a
+ * receive into a REGISTERED buffer keeps that region's own block - which
+ * lives in ARENA_H and must not be redirected, since a peer may RMA into
+ * it. Only a receive with no registration behind it gets a fresh block,
+ * and that comes from ARENA_G.
+ *
+ * The guest checks this before resolving an offset. It catches a tag that
+ * is out of range, one naming CTRL (which has no arena), and a transmit
+ * pointing into the receive arena - a host bug that would otherwise become
+ * a silent read of the wrong region and plausible garbage on the wire.
+ */
+#define SHIM_ARENA_BIT(r)  (1u << (r))
+#define SHIM_ARENA_M_H     SHIM_ARENA_BIT(SHIM_REG_ARENA_H)
+#define SHIM_ARENA_M_G     SHIM_ARENA_BIT(SHIM_REG_ARENA_G)
+
+static inline unsigned shim_op_arena_mask(uint32_t op)
+{
+	switch (op) {
+	/* the host stages these, so the block is always its own */
+	case SHIM_MR_REG:     case SHIM_MR_REGV:   case SHIM_MR_REG_PBL:
+	case SHIM_SEND:       case SHIM_SENDV:
+	case SHIM_TSEND:      case SHIM_TSENDV:
+	case SHIM_WRITE:      case SHIM_WRITESEG:  case SHIM_WRITE_SYNC:
+	case SHIM_ATOMIC:     case SHIM_ATOMIC_SYNC:
+	case SHIM_COMPARE_ATOMIC:
+		return SHIM_ARENA_M_H;
+
+	/* landing zones: fresh from ARENA_G, or the MR's own block in H */
+	case SHIM_RECV:       case SHIM_RECVV:
+	case SHIM_TRECV:      case SHIM_TRECVV:
+	case SHIM_READ:       case SHIM_READSEG:
+	case SHIM_FETCH_ATOMIC:
+		return SHIM_ARENA_M_G | SHIM_ARENA_M_H;
+
+	default:
+		return 0;            /* no arena buffer; off must be 0 */
+	}
+}
 
 /* Takes uint32_t, not enum shim_op: it is called on unvalidated peer data
  * while logging a message that may be garbage. Never returns NULL. */
@@ -478,8 +599,11 @@ struct shim_hdr {
  * transport with no shared region returns NULL and *len = 0, and the host
  * then falls back to inline payloads.
  */
-void *shim_xport_arena(size_t *len);
+/* An arena region's usable bytes. CTRL has no arena and returns NULL. */
+void *shim_xport_arena(unsigned reg, size_t *len);
+const char *shim_region_name(unsigned reg);          /* for logs  */
 
+unsigned shim_xport_ring_depth(void);                /* ring slots */
 const char *shim_xport_name(void);                     /* for logs  */
 int  shim_xport_connect(void);                         /* host      */
 int  shim_xport_listen(void);                          /* guest     */

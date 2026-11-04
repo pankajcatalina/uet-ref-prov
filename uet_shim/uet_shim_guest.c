@@ -201,7 +201,8 @@ static size_t cq_fmt_size(enum fi_cq_format fmt)
  * offset comes from the other side of a boundary we do not control: a
  * corrupt or hostile value must become -EINVAL, never a wild pointer.
  */
-static void *arena_in(uint64_t off, size_t len, int64_t *ret)
+static void *arena_in(uint32_t op, uint64_t off, size_t len,
+		      int64_t *ret)
 {
 	void *p;
 
@@ -221,10 +222,27 @@ static void *arena_in(uint64_t off, size_t len, int64_t *ret)
 	if (off == 0)
 		return NULL;
 
+	/*
+	 * The tag arrived over shared memory, so it is checked like any
+	 * other field before it becomes a pointer. A tag naming a region
+	 * this opcode has no business touching is a HOST bug - a transmit
+	 * pointed at the receive arena, say - and catching it here turns
+	 * what would be a silent read of the wrong arena, and plausible
+	 * garbage on the wire, into a refusal that names the opcode.
+	 */
+	if ((SHIM_ARENA_BIT(SHIM_OFF_REG(off)) & shim_op_arena_mask(op)) == 0) {
+		LOG("%s: offset names arena %u, allowed mask 0x%x\n",
+		    shim_op_name(op), SHIM_OFF_REG(off),
+		    shim_op_arena_mask(op));
+		*ret = -EINVAL;
+		return NULL;
+	}
+
 	p = shim_arena_ptr(off, len);
 	if (p == NULL) {
-		LOG("rejected arena offset %llu len %zu\n",
-		    (unsigned long long)off, len);
+		LOG("%s: rejected arena %u offset %llu len %zu\n",
+		    shim_op_name(op), SHIM_OFF_REG(off),
+		    (unsigned long long)SHIM_OFF_VAL(off), len);
 		*ret = -EINVAL;
 	}
 	return p;
@@ -519,7 +537,7 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		 * Nothing is allocated now, so nothing leaks on close either.
 		 */
 		rsp->ret = 0;
-		buf = arena_in(req->off, len, &rsp->ret);
+		buf = arena_in(req->op, req->off, len, &rsp->ret);
 		if (rsp->ret != 0)
 			break;
 
@@ -652,7 +670,7 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		void *buf;
 
 		rsp->ret = 0;
-		buf = arena_in(req->off, req->a2, &rsp->ret);
+		buf = arena_in(req->op, req->off, req->a2, &rsp->ret);
 		if (rsp->ret != 0)
 			break;
 		/* The arena block belongs to this operation until its
@@ -679,7 +697,7 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		}
 		rsp->ret = 0;
 		for (i = 0; i < cnt; i++) {
-			iov[i].iov_base = arena_in(req->off + tbl[i].off,
+			iov[i].iov_base = arena_in(req->op, req->off + tbl[i].off,
 						   tbl[i].len, &rsp->ret);
 			if (rsp->ret != 0)
 				break;
@@ -701,7 +719,7 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		void *buf;
 
 		rsp->ret = 0;
-		buf = arena_in(req->off, req->a2, &rsp->ret);
+		buf = arena_in(req->op, req->off, req->a2, &rsp->ret);
 		if (rsp->ret != 0)
 			break;
 		rsp->ret = uet_recv(hdl_get(req->h1), (uint32_t)req->a1,
@@ -724,7 +742,7 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		}
 		rsp->ret = 0;
 		for (i = 0; i < cnt; i++) {
-			iov[i].iov_base = arena_in(req->off + tbl[i].off,
+			iov[i].iov_base = arena_in(req->op, req->off + tbl[i].off,
 						   tbl[i].len, &rsp->ret);
 			if (rsp->ret != 0)
 				break;
@@ -752,7 +770,7 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		}
 		rsp->ret = 0;
 		for (i = 0; i < cnt; i++) {
-			iov[i].iov_base = arena_in(req->off + tbl[i].off,
+			iov[i].iov_base = arena_in(req->op, req->off + tbl[i].off,
 						   tbl[i].len, &rsp->ret);
 			if (rsp->ret != 0)
 				break;
@@ -779,7 +797,7 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		}
 		rsp->ret = 0;
 		for (i = 0; i < cnt; i++) {
-			iov[i].iov_base = arena_in(req->off + tbl[i].off,
+			iov[i].iov_base = arena_in(req->op, req->off + tbl[i].off,
 						   tbl[i].len, &rsp->ret);
 			if (rsp->ret != 0)
 				break;
@@ -803,7 +821,7 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 			break;
 		}
 		rsp->ret = 0;
-		buf = arena_in(req->off, req->a2, &rsp->ret);
+		buf = arena_in(req->op, req->off, req->a2, &rsp->ret);
 		if (rsp->ret != 0)
 			break;
 		rsp->ret = uet_tsend(hdl_get(req->h1), (uint32_t)req->a1,
@@ -822,7 +840,7 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 			break;
 		}
 		rsp->ret = 0;
-		buf = arena_in(req->off, req->a2, &rsp->ret);
+		buf = arena_in(req->op, req->off, req->a2, &rsp->ret);
 		if (rsp->ret != 0)
 			break;
 		rsp->ret = uet_trecv(hdl_get(req->h1), (uint32_t)req->a1,
@@ -857,7 +875,7 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 			break;
 		}
 		rsp->ret = 0;
-		buf = arena_in(req->off, ra->len, &rsp->ret);
+		buf = arena_in(req->op, req->off, ra->len, &rsp->ret);
 		if (rsp->ret != 0)
 			break;
 
@@ -950,12 +968,12 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 			rsp->ret = -EINVAL;
 			break;
 		}
-		/* all three are optional; arena_in() only reports an error
+		/* all three are optional; arena_in(req->op, ) only reports an error
 		 * for an offset that is non-zero AND out of range */
 		rsp->ret = 0;
-		op_buf  = arena_in(aa->op_off,  aa->bytes, &rsp->ret);
-		cmp_buf = arena_in(aa->cmp_off, aa->bytes, &rsp->ret);
-		res_buf = arena_in(aa->res_off, aa->bytes, &rsp->ret);
+		op_buf  = arena_in(req->op, aa->op_off,  aa->bytes, &rsp->ret);
+		cmp_buf = arena_in(req->op, aa->cmp_off, aa->bytes, &rsp->ret);
+		res_buf = arena_in(req->op, aa->res_off, aa->bytes, &rsp->ret);
 		if (rsp->ret != 0)
 			break;
 

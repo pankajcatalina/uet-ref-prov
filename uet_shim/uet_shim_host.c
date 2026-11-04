@@ -50,6 +50,25 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static char     g_payload[SHIM_MAX_PAYLOAD];   /* reply staging, under g_lock */
 
 /*
+ * Posted operations whose reply has not been collected yet.
+ *
+ * A data-path call returns FI_SUCCESS meaning QUEUED, not transferred, so
+ * it does not have to wait for the guest - that is what lets more than one
+ * be in flight. But the replies still arrive, and something has to retire
+ * them or the g2h ring fills and the guest stalls trying to answer.
+ * shim_rpc()'s wait loop does it: any reply that is not the one it is
+ * waiting for is somebody's post, and gets reaped there. uet_cq_read() is
+ * an RPC and is called constantly, so in practice that is the drain.
+ *
+ * g_post_max bounds it below the ring depth, which is what guarantees the
+ * g2h ring can never fill: at most g_post_max uncollected replies plus the
+ * one synchronous RPC in flight.
+ */
+static unsigned g_outstanding;
+static unsigned g_post_max;
+static uint64_t g_post_errors;
+
+/*
  * Clear our liveness flag when the process ends, so the guest's serve loop
  * breaks and it returns to accept() rather than spinning on a dead peer.
  * Does not help after SIGKILL, which is why both sides also time out.
@@ -97,8 +116,140 @@ static int shim_connect_once(void)
 		return -ENODEV;
 	}
 
-	fprintf(stderr, "[shim/host] connected over %s\n", shim_xport_name());
+	/*
+	 * Leave headroom below the ring depth. The reserve covers the
+	 * in-flight synchronous RPC and keeps a full ring from being the
+	 * thing that backpressures - the endpoint's descriptor pool should
+	 * be, since that is what the application sized.
+	 */
+	g_post_max = shim_xport_ring_depth();
+	g_post_max = (g_post_max > 16) ? (g_post_max - 16) : 1;
+
+	fprintf(stderr, "[shim/host] connected over %s (%u posts in flight)\n",
+		shim_xport_name(), g_post_max);
 	return 0;
+}
+
+/*
+ * Retire a reply that belongs to a posted operation rather than to the
+ * caller currently waiting.
+ *
+ * A negative return here is a failure the application was already told
+ * succeeded. Every case that can realistically produce one is checked on
+ * this side before posting - no CQ bound, no descriptor (credits), bad
+ * arguments, no arena - so reaching this path means an assumption broke,
+ * and it is logged loudly rather than counted silently. Surfacing it as a
+ * CQ error entry, which is where libfabric would want it, is not done yet.
+ */
+static void reap_posted(const struct shim_hdr *rsp)
+{
+	if (g_outstanding > 0)
+		g_outstanding--;
+
+	if (rsp->ret < 0) {
+		g_post_errors++;
+		fprintf(stderr, "[shim/host] POSTED %s (seq %u) failed after "
+			"the application was told it was queued: %lld "
+			"(%llu so far)\n",
+			shim_op_name(rsp->op), rsp->seq,
+			(long long)rsp->ret,
+			(unsigned long long)g_post_errors);
+	}
+}
+
+/* Posted operations not yet reaped. Exported for tests and diagnostics:
+ * it should return to zero whenever the ring has been drained. */
+unsigned shim_host_outstanding(void)
+{
+	return g_outstanding;
+}
+
+/*
+ * Post without waiting. The reply is reaped later by whichever RPC next
+ * drains the ring.
+ *
+ * Only legitimate for operations whose ssize_t is a POST STATUS rather
+ * than a byte count - the send and receive families - and whose callers
+ * read nothing back through *h. Anything that returns a value the caller
+ * uses (uet_mr_key, uet_cq_read, uet_getname, every control op) must stay
+ * on shim_rpc().
+ */
+static int64_t shim_rpc(uint32_t op, struct shim_hdr *h,
+			const void *in, uint32_t in_len,
+			void *reply_payload, size_t reply_cap,
+			uint32_t *reply_len);
+
+/*
+ * Kill switch. Asynchronous posting is the one change in ABI 6 that alters
+ * WHEN things happen rather than only how they are carried, so it can be
+ * turned off at run time: set UET_SHIM_SYNC=1 and every data-path call
+ * waits for its reply exactly as ABI 5 did, over the same ring.
+ *
+ * That makes the ring and the posting change separable on the rig without
+ * a rebuild - deploy once, then A/B. Same reasoning as UET_FORCE_MODE and
+ * UET_PDS, both of which earned their keep.
+ */
+static int shim_sync_mode(void)
+{
+	static int m = -1;
+
+	if (m < 0) {
+		const char *e = getenv("UET_SHIM_SYNC");
+
+		m = (e != NULL) && (*e != '0');
+		if (m)
+			fprintf(stderr, "[shim/host] UET_SHIM_SYNC: posting "
+					"synchronously, one op in flight\n");
+	}
+	return m;
+}
+
+static int64_t shim_post(uint32_t op, struct shim_hdr *h,
+			 const void *in, uint32_t in_len)
+{
+	int rc;
+
+	if (shim_sync_mode())
+		return shim_rpc(op, h, in, in_len, NULL, 0, NULL);
+
+	pthread_mutex_lock(&g_lock);
+
+	if (shim_connect_once() != 0) {
+		pthread_mutex_unlock(&g_lock);
+		return -FI_EIO;
+	}
+
+	/* Credits, checked here so -FI_EAGAIN costs no round trip. The
+	 * caller is expected to retry, which is exactly libfabric's
+	 * contract for it. */
+	if (g_outstanding >= g_post_max) {
+		pthread_mutex_unlock(&g_lock);
+		return -FI_EAGAIN;
+	}
+
+	h->op = op;
+	h->payload_len = in_len;
+	h->seq = ++g_seq;
+
+	rc = shim_send_msg(g_fd, h, in);
+	if (rc == -EAGAIN) {
+		/* ring full despite the credits: transient, not a protocol
+		 * error, so do NOT tear the connection down */
+		pthread_mutex_unlock(&g_lock);
+		return -FI_EAGAIN;
+	}
+	if (rc != 0) {
+		fprintf(stderr, "[shim/host] %s post failed: %s\n",
+			shim_op_name(op), strerror(-rc));
+		shim_xport_close(g_fd);
+		g_fd = -1;
+		pthread_mutex_unlock(&g_lock);
+		return -FI_EIO;
+	}
+
+	g_outstanding++;
+	pthread_mutex_unlock(&g_lock);
+	return FI_SUCCESS;
 }
 
 /* ===================================================================
@@ -243,6 +394,10 @@ static size_t iov_total(const struct iovec *iov, size_t n)
 static int stage_iov(const struct iovec *iov, size_t n,
 		     struct shim_iov *tbl, struct stage *st, int copy_in)
 {
+	/* copy_in already says which way the bytes travel: a transmit
+	 * stages into the arena the host writes, a receive reserves a
+	 * landing zone in the arena the guest writes. */
+	const unsigned reg = copy_in ? SHIM_REG_ARENA_H : SHIM_REG_ARENA_G;
 	size_t total = iov_total(iov, n);
 	uint64_t cur = 0;
 	size_t i;
@@ -274,13 +429,13 @@ static int stage_iov(const struct iovec *iov, size_t n,
 	if (total == 0) {
 		st->off = mr_off_for(iov[0].iov_base, 0);
 		if (st->off == 0) {
-			st->off = shim_arena_alloc(SHIM_ARENA_ALIGN);
+			st->off = shim_arena_alloc(reg, SHIM_ARENA_ALIGN);
 			if (st->off == 0) {
 				fprintf(stderr, "[shim/host] stage_iov: no "
 					"arena space for a zero-length op "
 					"(%zu free of %zu)\n",
-					shim_arena_avail(),
-					shim_arena_size());
+					shim_arena_avail(reg),
+					shim_arena_size(reg));
 				return -FI_ENOMEM;
 			}
 			st->owned = 1;
@@ -292,11 +447,11 @@ static int stage_iov(const struct iovec *iov, size_t n,
 		return 0;
 	}
 
-	st->off = shim_arena_alloc(total);
+	st->off = shim_arena_alloc(reg, total);
 	if (st->off == 0) {
 		fprintf(stderr, "[shim/host] stage_iov: no arena space for "
 			"%zu bytes (%zu free of %zu)\n",
-			total, shim_arena_avail(), shim_arena_size());
+			total, shim_arena_avail(reg), shim_arena_size(reg));
 		return -FI_ENOMEM;
 	}
 	st->owned = 1;
@@ -351,11 +506,11 @@ static int stage_tx(const void *buf, size_t len, struct stage *st)
 			return 0;     /* nothing to point at and nothing to
 				       * copy: a zero-length buffer outside
 				       * any region has no arena address */
-		st->off = shim_arena_alloc(len);
+		st->off = shim_arena_alloc(SHIM_REG_ARENA_H, len);
 		if (st->off == 0) {
 			fprintf(stderr, "[shim/host] stage_tx: no arena space "
 				"for %zu bytes (%zu free of %zu)\n",
-				len, shim_arena_avail(), shim_arena_size());
+				len, shim_arena_avail(SHIM_REG_ARENA_H), shim_arena_size(SHIM_REG_ARENA_H));
 			return -FI_ENOMEM;
 		}
 		st->owned = 1;
@@ -388,13 +543,19 @@ static int stage_rx(void *buf, size_t len, struct stage *st)
 	if (buf == NULL)
 		return 0;
 
+	/*
+	 * A registered buffer keeps its own block, which lives in ARENA_H
+	 * and must not be redirected - a peer may RMA straight into it.
+	 * Everything else gets a fresh landing zone in ARENA_G, the arena
+	 * the guest's stack writes.
+	 */
 	st->off = mr_off_for(buf, len);
 	if ((st->off == 0) && (len > 0)) {
-		st->off = shim_arena_alloc(len);
+		st->off = shim_arena_alloc(SHIM_REG_ARENA_G, len);
 		if (st->off == 0) {
 			fprintf(stderr, "[shim/host] stage_rx: no arena space "
 				"for %zu bytes (%zu free of %zu)\n",
-				len, shim_arena_avail(), shim_arena_size());
+				len, shim_arena_avail(SHIM_REG_ARENA_G), shim_arena_size(SHIM_REG_ARENA_G));
 			return -FI_ENOMEM;
 		}
 		st->owned = 1;
@@ -450,21 +611,35 @@ static int64_t shim_rpc(uint32_t op, struct shim_hdr *h,
 	if (rc != 0)
 		goto fail;
 
-	rc = shim_recv_msg(g_fd, &rsp, g_payload, sizeof(g_payload));
-	if (rc != 0)
-		goto fail;
-
 	/*
-	 * A correctness backstop independent of the transport: even if the
-	 * doorbell logic were wrong, a reply belonging to a different
-	 * request is detected rather than silently used. This is the check
-	 * that caught the reconnect bug ("seq 220 != 1").
+	 * Replies now arrive interleaved: posted operations do not wait, so
+	 * what comes back first is whatever the guest finished first. Drain
+	 * until this request's own seq appears, retiring the others.
+	 *
+	 * The ring is FIFO and the guest is a single consumer, so a reply
+	 * CANNOT arrive before one posted earlier - which bounds this loop
+	 * by the number outstanding and means a seq that is never seen is a
+	 * genuine protocol fault, not a reordering.
 	 */
-	if (rsp.seq != h->seq) {
-		fprintf(stderr, "[shim/host] %s: seq %u != %u (out of sync)\n",
-			shim_op_name(op), rsp.seq, h->seq);
-		rc = -EPROTO;
-		goto fail;
+	for (;;) {
+		rc = shim_recv_msg(g_fd, &rsp, g_payload, sizeof(g_payload));
+		if (rc != 0)
+			goto fail;
+
+		if (rsp.seq == h->seq)
+			break;
+
+		/* Not ours. It belongs to a post, unless the channel is
+		 * genuinely out of sync - which only shows as a seq we
+		 * never issued, and g_outstanding catches that. */
+		if (g_outstanding == 0) {
+			fprintf(stderr, "[shim/host] %s: seq %u != %u and "
+				"nothing outstanding (out of sync)\n",
+				shim_op_name(op), rsp.seq, h->seq);
+			rc = -EPROTO;
+			goto fail;
+		}
+		reap_posted(&rsp);
 	}
 
 	/* Clamp the copy, but report the FULL declared length, so the caller
@@ -847,11 +1022,11 @@ int uet_mr_reg(uet_domain_handle_t domain_handle, const void *buf, size_t len,
 	if (len == 0)
 		return -FI_EINVAL;
 
-	off = shim_arena_alloc(len);
+	off = shim_arena_alloc(SHIM_REG_ARENA_H, len);
 	if (off == 0) {
 		fprintf(stderr, "[shim/host] mr_reg: no arena space for %zu "
 				"bytes (largest free run %zu)\n",
-			len, shim_arena_avail());
+			len, shim_arena_avail(SHIM_REG_ARENA_H));
 		return -FI_ENOMEM;
 	}
 
@@ -1159,7 +1334,7 @@ ssize_t uet_send(uet_ep_handle_t ep_handle, uint32_t job_id,
 	h.off = st.off;
 	ctx_attach(h.a4, &st);
 
-	return (ssize_t)shim_rpc(SHIM_SEND, &h, NULL, 0, NULL, 0, NULL);
+	return (ssize_t)shim_post(SHIM_SEND, &h, NULL, 0);
 }
 
 
@@ -1194,9 +1369,8 @@ ssize_t uet_sendv(uet_ep_handle_t ep_handle, uint32_t job_id,
 	h.off = st.off;
 	ctx_attach(h.a4, &st);
 
-	return (ssize_t)shim_rpc(SHIM_SENDV, &h, tbl,
-				 (uint32_t)(iov_count * sizeof(tbl[0])),
-				 NULL, 0, NULL);
+	return (ssize_t)shim_post(SHIM_SENDV, &h, tbl,
+				 (uint32_t)(iov_count * sizeof(tbl[0])));
 }
 
 ssize_t uet_recv(uet_ep_handle_t ep_handle, uint32_t job_id,
@@ -1233,7 +1407,7 @@ ssize_t uet_recv(uet_ep_handle_t ep_handle, uint32_t job_id,
 	h.off = st.off;
 	ctx_attach(h.a4, &st);
 
-	return (ssize_t)shim_rpc(SHIM_RECV, &h, NULL, 0, NULL, 0, NULL);
+	return (ssize_t)shim_post(SHIM_RECV, &h, NULL, 0);
 }
 
 ssize_t uet_tsendv(uet_ep_handle_t ep_handle, uint32_t job_id,
@@ -1273,10 +1447,9 @@ ssize_t uet_tsendv(uet_ep_handle_t ep_handle, uint32_t job_id,
 	h.off = st.off;
 	ctx_attach(h.a4, &st);
 
-	return (ssize_t)shim_rpc(SHIM_TSENDV, &h, &pkt,
+	return (ssize_t)shim_post(SHIM_TSENDV, &h, &pkt,
 				 (uint32_t)(sizeof(pkt.ta) +
-					    iov_count * sizeof(pkt.tbl[0])),
-				 NULL, 0, NULL);
+					    iov_count * sizeof(pkt.tbl[0])));
 }
 
 ssize_t uet_trecvv(uet_ep_handle_t ep_handle, uint32_t job_id,
@@ -1330,10 +1503,9 @@ ssize_t uet_trecvv(uet_ep_handle_t ep_handle, uint32_t job_id,
 	ctx_attach(h.a4, &st);
 	ctx_attach_iov(h.a4, keep, iov_count);
 
-	return (ssize_t)shim_rpc(SHIM_TRECVV, &h, &pkt,
+	return (ssize_t)shim_post(SHIM_TRECVV, &h, &pkt,
 				 (uint32_t)(sizeof(pkt.ta) +
-					    iov_count * sizeof(pkt.tbl[0])),
-				 NULL, 0, NULL);
+					    iov_count * sizeof(pkt.tbl[0])));
 }
 
 /*
@@ -1405,9 +1577,8 @@ ssize_t uet_recvv(uet_ep_handle_t ep_handle, uint32_t job_id,
 	ctx_attach(h.a4, &st);
 	ctx_attach_iov(h.a4, keep, iov_count);
 
-	return (ssize_t)shim_rpc(SHIM_RECVV, &h, tbl,
-				 (uint32_t)(iov_count * sizeof(tbl[0])),
-				 NULL, 0, NULL);
+	return (ssize_t)shim_post(SHIM_RECVV, &h, tbl,
+				 (uint32_t)(iov_count * sizeof(tbl[0])));
 }
 
 ssize_t uet_tsend(uet_ep_handle_t ep_handle, uint32_t job_id,
@@ -1439,8 +1610,7 @@ ssize_t uet_tsend(uet_ep_handle_t ep_handle, uint32_t job_id,
 	h.off = st.off;
 	ctx_attach(h.a4, &st);
 
-	return (ssize_t)shim_rpc(SHIM_TSEND, &h, &ta, sizeof(ta),
-				 NULL, 0, NULL);
+	return (ssize_t)shim_post(SHIM_TSEND, &h, &ta, sizeof(ta));
 }
 
 ssize_t uet_trecv(uet_ep_handle_t ep_handle, uint32_t job_id,
@@ -1472,8 +1642,7 @@ ssize_t uet_trecv(uet_ep_handle_t ep_handle, uint32_t job_id,
 	h.off = st.off;
 	ctx_attach(h.a4, &st);
 
-	return (ssize_t)shim_rpc(SHIM_TRECV, &h, &ta, sizeof(ta),
-				 NULL, 0, NULL);
+	return (ssize_t)shim_post(SHIM_TRECV, &h, &ta, sizeof(ta));
 }
 
 /*

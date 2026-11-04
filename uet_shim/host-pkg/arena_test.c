@@ -16,15 +16,36 @@
 #include "uet_shim_arena.h"
 
 #define FAKE_SIZE (1u << 20)
-static char fake[FAKE_SIZE];
+static char fake[FAKE_SIZE];          /* ARENA_H, the one under test */
+static char fake_g[FAKE_SIZE];        /* ARENA_G, mapped but unused  */
 
-/* stands in for uet_shim_xport_shm.c */
-void *shim_xport_arena(size_t *len)
+/* stands in for uet_shim_xport_shm.c. Both arenas must map or
+ * shim_arena_init() refuses, so the second is provided even though no case
+ * below allocates from it. */
+void *shim_xport_arena(unsigned reg, size_t *len)
 {
 	if (len != NULL)
 		*len = FAKE_SIZE;
-	return fake;
+
+	if (reg == SHIM_REG_ARENA_H)
+		return fake;
+	if (reg == SHIM_REG_ARENA_G)
+		return fake_g;
+
+	if (len != NULL)
+		*len = 0;
+	return NULL;
 }
+
+const char *shim_region_name(unsigned reg)
+{
+	return (reg == SHIM_REG_ARENA_H) ? "arena_h" : "arena_g";
+}
+
+/* Every allocation below comes from ARENA_H, so wrap the two calls whose
+ * signature now names a region and leave the rest of the cases readable. */
+#define ALLOC(n)  shim_arena_alloc(SHIM_REG_ARENA_H, (n))
+#define AVAIL()   shim_arena_avail(SHIM_REG_ARENA_H)
 
 static int fails;
 
@@ -48,16 +69,16 @@ int main(void)
 	printf("=== CHECKPOINT 3: arena allocator ===\n");
 
 	CHECK(shim_arena_init() == 0, "init");
-	CHECK(shim_arena_size() == FAKE_SIZE, "size reported as given");
+	CHECK(shim_arena_size(SHIM_REG_ARENA_H) == FAKE_SIZE, "size reported as given");
 
 	/* --- offset 0 must never be handed out: hdr.off == 0 means "none" */
-	a = shim_arena_alloc(100);
+	a = ALLOC(100);
 	CHECK(a >= SHIM_ARENA_ALIGN, "first alloc skips offset 0 (got %lu)",
 	      (unsigned long)a);
 
 	/* --- alignment, so two live blocks cannot share a cache line */
-	b = shim_arena_alloc(1);
-	c = shim_arena_alloc(4096);
+	b = ALLOC(1);
+	c = ALLOC(4096);
 	CHECK((a % SHIM_ARENA_ALIGN) == 0 && (b % SHIM_ARENA_ALIGN) == 0 &&
 	      (c % SHIM_ARENA_ALIGN) == 0, "all offsets %u-aligned",
 	      SHIM_ARENA_ALIGN);
@@ -68,17 +89,23 @@ int main(void)
 	      (unsigned long)c);
 
 	/* --- resolution, and the bounds checks the guest depends on */
-	CHECK(shim_arena_ptr(a, 100) == (fake + a), "ptr resolves");
+	CHECK(shim_arena_ptr(a, 100) == (fake + SHIM_OFF_VAL(a)),
+      "ptr resolves");
+	CHECK(SHIM_OFF_REG(a) == SHIM_REG_ARENA_H,
+	      "offset carries its region tag");
 	CHECK(shim_arena_ptr(0, 1) == NULL, "offset 0 rejected");
-	CHECK(shim_arena_ptr(FAKE_SIZE, 1) == NULL, "offset past end rejected");
-	CHECK(shim_arena_ptr(FAKE_SIZE - 10, 100) == NULL,
+	CHECK(shim_arena_ptr(SHIM_OFF(SHIM_REG_ARENA_H, FAKE_SIZE), 1)
+      == NULL, "offset past end rejected");
+	CHECK(shim_arena_ptr(SHIM_OFF(SHIM_REG_ARENA_H, FAKE_SIZE - 10),
+                     100) == NULL,
 	      "range crossing the end rejected");
-	CHECK(shim_arena_ptr(64, (size_t)-1) == NULL,
+	CHECK(shim_arena_ptr(SHIM_OFF(SHIM_REG_ARENA_H, 64),
+                     (size_t)-1) == NULL,
 	      "wrapping length rejected");
 
 	/* --- reuse: a freed block must come back */
 	shim_arena_free(b);
-	CHECK(shim_arena_alloc(1) == b, "freed block is reused");
+	CHECK(ALLOC(1) == b, "freed block is reused");
 	shim_arena_free(b);
 
 	/* --- coalescing, the one that matters.
@@ -88,7 +115,7 @@ int main(void)
 	shim_arena_free(a);
 	shim_arena_free(c);
 	for (i = 0; i < 64; i++)
-		many[i] = shim_arena_alloc(8192);
+		many[i] = ALLOC(8192);
 	CHECK(many[63] != 0, "64 x 8 KiB all allocated");
 
 	for (i = 0; i < 64; i += 2)          /* evens first... */
@@ -96,25 +123,64 @@ int main(void)
 	for (i = 1; i < 64; i += 2)          /* ...then odds   */
 		shim_arena_free(many[i]);
 
-	big = shim_arena_alloc(FAKE_SIZE - SHIM_ARENA_ALIGN);
+	big = ALLOC(FAKE_SIZE - SHIM_ARENA_ALIGN);
 	CHECK(big != 0, "whole arena allocatable again -> extents coalesced");
 	shim_arena_free(big);
 
 	/* --- exhaustion is reported, not faked */
-	CHECK(shim_arena_alloc(FAKE_SIZE * 2) == 0,
+	CHECK(ALLOC(FAKE_SIZE * 2) == 0,
 	      "oversized request refused");
-	CHECK(shim_arena_alloc(0) == 0, "zero-length request refused");
+	CHECK(ALLOC(0) == 0, "zero-length request refused");
 
-	big = shim_arena_alloc(FAKE_SIZE - SHIM_ARENA_ALIGN);
-	CHECK(shim_arena_alloc(64) == 0, "full arena refuses further allocs");
+	big = ALLOC(FAKE_SIZE - SHIM_ARENA_ALIGN);
+	CHECK(ALLOC(64) == 0, "full arena refuses further allocs");
 	shim_arena_free(big);
-	CHECK(shim_arena_alloc(64) != 0, "and recovers after a free");
+	CHECK(ALLOC(64) != 0, "and recovers after a free");
 
 	/* --- a double free must not corrupt the list */
-	a = shim_arena_alloc(256);
+	a = ALLOC(256);
 	shim_arena_free(a);
 	shim_arena_free(a);
-	CHECK(shim_arena_alloc(256) == a, "double free tolerated");
+	CHECK(ALLOC(256) == a, "double free tolerated");
+
+	/* ---- per-opcode arena mask: the rule BOTH sides compile ---- */
+	printf("\n-- opcode -> arena mask --\n");
+
+	CHECK(shim_op_arena_mask(SHIM_TSENDV) == SHIM_ARENA_M_H,
+	      "a transmit may only name ARENA_H");
+	CHECK(shim_op_arena_mask(SHIM_SEND) == SHIM_ARENA_M_H,
+	      "untagged send likewise");
+	CHECK(shim_op_arena_mask(SHIM_MR_REG) == SHIM_ARENA_M_H,
+	      "a registration names the host arena");
+	CHECK(shim_op_arena_mask(SHIM_TRECVV) ==
+	      (SHIM_ARENA_M_G | SHIM_ARENA_M_H),
+	      "a receive may name either: fresh in G, or an MR's block in H");
+	CHECK(shim_op_arena_mask(SHIM_CQ_READ) == 0,
+	      "an op with no arena buffer allows none");
+	CHECK(shim_op_arena_mask(SHIM_EP_ENABLE) == 0,
+	      "control ops allow none");
+
+	/* exactly the predicate the guest applies before resolving */
+#define ALLOWED(op, off) \
+	((SHIM_ARENA_BIT(SHIM_OFF_REG(off)) & shim_op_arena_mask(op)) != 0)
+
+	CHECK( ALLOWED(SHIM_TSENDV, SHIM_OFF(SHIM_REG_ARENA_H, 64)),
+	      "transmit from ARENA_H accepted");
+	CHECK(!ALLOWED(SHIM_TSENDV, SHIM_OFF(SHIM_REG_ARENA_G, 64)),
+	      "transmit from ARENA_G REFUSED");
+	CHECK( ALLOWED(SHIM_TRECVV, SHIM_OFF(SHIM_REG_ARENA_G, 64)),
+	      "receive into ARENA_G accepted");
+	CHECK( ALLOWED(SHIM_TRECVV, SHIM_OFF(SHIM_REG_ARENA_H, 64)),
+	      "receive into a registered block in ARENA_H accepted");
+	CHECK(!ALLOWED(SHIM_TRECVV, SHIM_OFF(SHIM_REG_CTRL, 64)),
+	      "CTRL has no arena and is REFUSED");
+	CHECK(!ALLOWED(SHIM_TSENDV, SHIM_OFF(7, 64)),
+	      "an out-of-range tag is REFUSED");
+
+	/* this side owns ARENA_H only, so ARENA_G must refuse to allocate -
+	 * the single-allocator rule, asserted */
+	CHECK(shim_arena_alloc(SHIM_REG_ARENA_G, 128) == 0,
+	      "the arena this side does not own refuses to allocate");
 
 	printf("\n%s (%d failure%s)\n", fails ? "FAILED" : "all passed",
 	       fails, (fails == 1) ? "" : "s");

@@ -9,6 +9,8 @@ uet
 uet_shim/uet_shim_guest
 uet_shim/xport_test
 uet_shim/arena_test
+uet_shim/post_test
+uet_shim/host-pkg/post_test
 uet_shim/uet_via_shim
 uet_shim/host-pkg/arena_test
 uet_shim/shim_smoke

@@ -123,6 +123,11 @@ uet_shim_testhelp.o: uet_shim_testhelp.c
 shim_smoke: shim_smoke.c uet_shim_host.o $(COMMON)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS) $(RPATH_LF)
 
+# Drives the real uet_* stubs to prove the host gets more than one request
+# in flight. Run against "xport_test guest".
+post_test: post_test.c uet_shim_host.o $(COMMON)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS) $(RPATH_LF)
+
 uet_shim_info.o: uet_shim_info.c uet_shim.h uet_shim_info.h
 	$(CC) $(CFLAGS) -c $< -o $@
 uet_shim_host.o: uet_shim_host.c uet_shim.h uet_shim_info.h
@@ -138,7 +143,8 @@ uet_shim_guest.o: uet_shim_guest.c uet_shim.h uet_shim_info.h
 HOST_PKG_FILES = uet_shim.h uet_shim_info.h uet_shim_info.c \
                  uet_shim_common.c uet_shim_xport_shm.c \
                  uet_shim_arena.h uet_shim_arena.c arena_test.c \
-                 uet_shim_host.c shim_smoke.c xport_test.c
+                 uet_shim_host.c shim_smoke.c xport_test.c \
+                 post_test.c
 
 host-pkg:
 	@rm -rf host-pkg && mkdir -p host-pkg

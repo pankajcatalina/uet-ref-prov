@@ -152,13 +152,13 @@ int main(int argc, char **argv)
 	 *     mailbox. 1 MiB is four times the old inline cap. */
 	{
 		const size_t len = 1u << 20;
-		uint64_t off = shim_arena_alloc(len);
+		uint64_t off = shim_arena_alloc(SHIM_REG_ARENA_H, len);
 		unsigned char *p = shim_arena_ptr(off, len);
 		size_t k, bad = 0;
 
 		if ((off == 0) || (p == NULL)) {
 			printf("[host]  ARENA alloc FAILED (largest free "
-			       "run %zu)\n", shim_arena_avail());
+			       "run %zu)\n", shim_arena_avail(SHIM_REG_ARENA_H));
 			return 1;
 		}
 		for (k = 0; k < len; k++)
@@ -221,6 +221,42 @@ int main(int argc, char **argv)
 		printf("[host]  %u KiB messages: mean %.2f us (%.1f GB/s)\n",
 		       SHIM_MAX_PAYLOAD >> 10, (us() - t0) / i,
 		       (2.0 * i * SHIM_MAX_PAYLOAD) / ((us() - t0) * 1e3));
+	}
+
+	/* 4. depth: post a burst with NOTHING read in between, then collect
+	 *    every reply. Under the ABI 5 single-slot mailbox the second
+	 *    post would have overwritten the first and the replies would
+	 *    never have balanced. */
+	{
+		unsigned depth = shim_xport_ring_depth();
+		unsigned burst = depth - 1;      /* leave a slot spare */
+		unsigned sent = 0, got = 0, order_ok = 1;
+		double t0;
+
+		h.payload_len = 0;
+		t0 = us();
+		for (i = 0; i < (int)burst; i++) {
+			h.a1 = (uint64_t)i;
+			if (shim_send_msg(fd, &h, NULL) != 0)
+				break;
+			sent++;
+		}
+		for (i = 0; i < (int)sent; i++) {
+			if (shim_recv_msg(fd, &h, pay, sizeof(pay)) != 0)
+				break;
+			if (h.a1 != (uint64_t)i)
+				order_ok = 0;
+			got++;
+		}
+		printf("[host]  burst: ring depth %u, posted %u with no read "
+		       "in between, %u replies, order %s, %.3f us/msg\n",
+		       depth, sent, got, order_ok ? "FIFO" : "BROKEN",
+		       (us() - t0) / (sent ? sent : 1));
+		if ((sent != burst) || (got != sent) || !order_ok) {
+			printf("[host]  DEPTH TEST FAILED\n");
+			shim_xport_close(fd);
+			return 1;
+		}
 	}
 
 	shim_xport_close(fd);
