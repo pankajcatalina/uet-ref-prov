@@ -99,7 +99,31 @@ static void arena_own(unsigned reg)
 /* Both sides map BOTH arenas - resolving an offset in the arena the peer
  * owns is the normal case. They differ only in which free list they set up.
  */
-static int arena_map_all(unsigned own)
+/*
+ * Both sides map BOTH arenas - resolving an offset in the arena the peer
+ * fills is the normal case. They differ only in which free lists they
+ * set up.
+ *
+ * The HOST owns both. It is the side that knows what the application
+ * asked for: it stages a transmit into ARENA_H and reserves a landing
+ * zone in ARENA_G, and it is the only side that can size either, because
+ * only it has seen the iovec. The guest resolves offsets and writes into
+ * the landing zone, but never allocates.
+ *
+ * An earlier revision gave ARENA_G to the guest, on the reasoning that
+ * the side which WRITES a region should own it. That is wrong twice
+ * over: an MR is written by both sides by design, so single-writer was
+ * never achievable; and the host is the side that knows a receive is
+ * coming, so making it ask the guest for the address would add a round
+ * trip to the one path that must not have one. The invariant that
+ * matters is one free list with one owner, which this satisfies.
+ *
+ * It is also what the host code already assumed - stage_rx() allocates
+ * from ARENA_G - and the mismatch showed up as "no arena space for 8
+ * bytes (0 free of 132120576)": mapped, empty, and refusing because the
+ * caller did not own it.
+ */
+static int arena_map_all(int is_host)
 {
 	int rc = arena_map_one(SHIM_REG_ARENA_H);
 
@@ -110,18 +134,21 @@ static int arena_map_all(unsigned own)
 	if (rc != 0)
 		return rc;
 
-	arena_own(own);
+	if (is_host) {
+		arena_own(SHIM_REG_ARENA_H);
+		arena_own(SHIM_REG_ARENA_G);
+	}
 	return 0;
 }
 
-int shim_arena_init(void)                /* host owns ARENA_H */
+int shim_arena_init(void)                /* host owns both free lists */
 {
-	return arena_map_all(SHIM_REG_ARENA_H);
+	return arena_map_all(1);
 }
 
-int shim_arena_attach(void)              /* guest owns ARENA_G */
+int shim_arena_attach(void)              /* guest resolves only */
 {
-	return arena_map_all(SHIM_REG_ARENA_G);
+	return arena_map_all(0);
 }
 
 size_t shim_arena_size(unsigned reg)

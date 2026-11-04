@@ -177,10 +177,31 @@ int main(void)
 	CHECK(!ALLOWED(SHIM_TSENDV, SHIM_OFF(7, 64)),
 	      "an out-of-range tag is REFUSED");
 
-	/* this side owns ARENA_H only, so ARENA_G must refuse to allocate -
-	 * the single-allocator rule, asserted */
-	CHECK(shim_arena_alloc(SHIM_REG_ARENA_G, 128) == 0,
-	      "the arena this side does not own refuses to allocate");
+	/* The HOST owns BOTH free lists: it stages transmits into ARENA_H
+	 * and reserves landing zones in ARENA_G, because it is the only
+	 * side that has seen the iovec. Asking the guest for a receive
+	 * address would put a round trip on the one path that must not
+	 * have one. */
+	{
+		uint64_t h = shim_arena_alloc(SHIM_REG_ARENA_H, 128);
+		uint64_t g = shim_arena_alloc(SHIM_REG_ARENA_G, 128);
+
+		CHECK(h != 0, "the host can allocate a transmit block in H");
+		CHECK(g != 0, "the host can allocate a landing zone in G");
+		CHECK(SHIM_OFF_REG(h) == SHIM_REG_ARENA_H &&
+		      SHIM_OFF_REG(g) == SHIM_REG_ARENA_G,
+		      "each carries the tag of the arena it came from");
+		CHECK( ALLOWED(SHIM_TSENDV, h) && !ALLOWED(SHIM_TSENDV, g),
+		      "...so only the H block is usable as a transmit source");
+		CHECK( ALLOWED(SHIM_TRECVV, g),
+		      "...and the G block is usable as a landing zone");
+		shim_arena_free(h);
+		shim_arena_free(g);
+	}
+
+	/* CTRL carries no arena at all */
+	CHECK(shim_arena_alloc(SHIM_REG_CTRL, 128) == 0,
+	      "a region with no arena refuses to allocate");
 
 	printf("\n%s (%d failure%s)\n", fails ? "FAILED" : "all passed",
 	       fails, (fails == 1) ? "" : "s");

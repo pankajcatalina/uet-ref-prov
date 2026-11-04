@@ -52,7 +52,7 @@ int main(void)
 {
 	static char buf[256];
 	struct iovec iov = { buf, sizeof(buf) };
-	unsigned posted = 0, before;
+	unsigned posted = 0, before, base;
 	ssize_t rc = 0;
 	int i;
 
@@ -88,8 +88,27 @@ int main(void)
 		(void)uet_initialize(&handle);
 	}
 
+	/*
+	 * 0. One of EACH first. A transmit stages into ARENA_H, a receive
+	 *    reserves a landing zone in ARENA_G - different arenas, and
+	 *    for a while the host did not own the second one's free list.
+	 *    That shipped because every loopback test posted only sends,
+	 *    and it surfaced on the rig as "no arena space for 8 bytes
+	 *    (0 free of 132120576)": mapped, empty, and refusing.
+	 */
+	rc = uet_tsendv(FAKE_EP, 1, &iov, 1, FAKE_MR, FAKE_AV, 0x1234,
+			(void *)(uintptr_t)0x5e4d);
+	CHECK(rc == 0, "a transmit posts, staging into ARENA_H (got %zd)", rc);
+
+	rc = uet_trecvv(FAKE_EP, 1, &iov, 1, FAKE_MR, FAKE_AV, 0x1234, 0,
+			(void *)(uintptr_t)0x4ecb);
+	CHECK(rc == 0, "a receive posts, landing zone from ARENA_G (got %zd)",
+	      rc);
+
 	/* 1. post until the credits run out. Under ABI 5 the second call
 	 *    could not even be issued before the first had been answered. */
+	base = shim_host_outstanding();      /* the two posted above */
+
 	for (i = 0; i < 100000; i++) {
 		rc = uet_tsendv(FAKE_EP, 1, &iov, 1, FAKE_MR, FAKE_AV,
 				0x1234, (void *)(uintptr_t)(i + 1));
@@ -103,9 +122,9 @@ int main(void)
 	CHECK(rc == -FI_EAGAIN,
 	      "the post after the last credit is refused with -FI_EAGAIN "
 	      "(got %zd)", rc);
-	CHECK(shim_host_outstanding() == posted,
-	      "outstanding accounting matches what was posted (%u)",
-	      shim_host_outstanding());
+	CHECK(shim_host_outstanding() == (base + posted),
+	      "outstanding accounting matches what was posted (%u = %u + %u)",
+	      shim_host_outstanding(), base, posted);
 
 	/* 2. one synchronous RPC must retire every posted reply on its way
 	 *    to its own - this is what keeps the g2h ring from filling. */
