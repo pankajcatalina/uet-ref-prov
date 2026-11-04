@@ -88,6 +88,39 @@ guest: uet_shim_guest
 uet_shim_guest: uet_shim_guest.o $(COMMON)
 	$(CC) $^ -o $@ -L$(UETDIR) -luet_fabric $(LDLIBS) $(RPATH)
 
+# ---------------------------------------------------------------- guest-dev
+#
+# The same guest shim, but over LIBUET and therefore over uet.ko and the
+# QEMU uet-pci device, instead of the in-process stack in libuet_fabric.so.
+# Both implement uet_api.h, which is the whole point of splitting there: the
+# dispatcher does not change, only what it links against.
+#
+#   make guest-dev LIBUET=/path/to/libuet
+#
+# libuet implements the 29 functions a provider needs. The dispatcher covers
+# the whole API because the protocol carries opcodes for all of it, so
+# uet_shim_stubs.o supplies the remaining 14 - RMA, atomics, and four
+# messaging variants - as -FI_ENOSYS.
+#
+# Build this ON THE VM. libuet is linked, not dlopened, so its glibc has to
+# be the one you run against.
+LIBUET ?= /opt/libuet
+
+uet_shim_stubs.o: uet_shim_stubs.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+guest-dev: uet_shim_guest_dev
+uet_shim_guest_dev: uet_shim_guest.o uet_shim_stubs.o $(COMMON)
+	@test -f $(LIBUET)/libuet.so || { \
+		echo "no libuet.so under LIBUET=$(LIBUET)"; \
+		echo "  make guest-dev LIBUET=/path/to/libuet"; exit 1; }
+	$(CC) $^ -o $@ -L$(LIBUET) -l:libuet.so $(LDLIBS) \
+	      -Wl,-rpath,$(abspath $(LIBUET)) $(RPATH_LF)
+	@echo
+	@echo "linked against libuet: control via uet.ko, data via uet-pci"
+	@nm -D --undefined-only $@ | grep -c ' uet_' | \
+	   xargs -I{} echo "  unresolved uet_* symbols: {} (must be 0)"
+
 # A drop-in replacement for libuet_fabric.so. libuetprov-fi.so leaves the 25
 # uet_* symbols UNDEFINED and resolves them from the process's global scope at
 # load time, so nothing above uet_api.h has to be relinked: preload this
@@ -163,4 +196,4 @@ clean:
 	      shim_smoke arena_test uet_via_shim
 	rm -rf host-pkg
 
-.PHONY: all host guest clean host-pkg
+.PHONY: all host guest guest-dev clean host-pkg
