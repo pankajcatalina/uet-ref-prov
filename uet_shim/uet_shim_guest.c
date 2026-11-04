@@ -74,7 +74,28 @@ static unsigned long g_log_calls = 64;
  * as the key here, so the two must agree or a valid id indexes nothing. */
 #define CTX_MAX_GUEST 4096
 
+/*
+ * What each live handle is, so a session that ends without the host
+ * closing things can still be unwound.
+ *
+ * The order matters and is the API's, not ours: a region must be
+ * disabled before it can be closed, and an endpoint refuses to close
+ * with sends outstanding. Against the in-process stack leaking these
+ * costs guest memory; against libuet it strands pinned pages and device
+ * endpoints in the driver until the process exits.
+ */
+enum hdl_kind {
+	HDL_NONE = 0,
+	HDL_INSTANCE,
+	HDL_DOMAIN,
+	HDL_EP,
+	HDL_CQ,
+	HDL_MR,
+	HDL_AV,
+};
+
 static void *hdl_tbl[HDL_MAX];
+static uint8_t hdl_kind[HDL_MAX];
 
 /*
  * uet_av_insert() does NOT copy the address it is given - it stores the
@@ -90,7 +111,7 @@ static void *hdl_tbl[HDL_MAX];
 static struct uet_addr *av_addr[HDL_MAX];
 static uint64_t hdl_next = 1;
 
-static shim_handle_t hdl_put(void *p)
+static shim_handle_t hdl_put(void *p, enum hdl_kind kind)
 {
 	uint64_t i;
 
@@ -102,6 +123,7 @@ static shim_handle_t hdl_put(void *p)
 	for (i = hdl_next; i < HDL_MAX; i++) {
 		if (hdl_tbl[i] == NULL) {
 			hdl_tbl[i] = p;
+			hdl_kind[i] = (uint8_t)kind;
 			hdl_next = i + 1;
 			return (shim_handle_t)i;
 		}
@@ -109,6 +131,7 @@ static shim_handle_t hdl_put(void *p)
 	for (i = 1; i < hdl_next; i++) {
 		if (hdl_tbl[i] == NULL) {
 			hdl_tbl[i] = p;
+			hdl_kind[i] = (uint8_t)kind;
 			hdl_next = i + 1;
 			return (shim_handle_t)i;
 		}
@@ -123,6 +146,69 @@ static shim_handle_t hdl_put(void *p)
  * pointers travelled on the wire, the same value would be a dereference of
  * memory the peer chose.
  */
+/*
+ * Unwind whatever the host left behind when a session ends.
+ *
+ * A clean teardown closes everything itself and this finds nothing. It
+ * matters when the host crashed or was killed: against libuet those
+ * handles hold pinned pages and device endpoints that the driver will
+ * not release until the process exits, and the shim does not exit - it
+ * goes back to accept().
+ *
+ * The order is the API's. A region must be disabled before it can be
+ * closed, and an endpoint refuses to close with sends outstanding, so
+ * regions go first and the instance last. Return values are ignored:
+ * this runs when something has already gone wrong, and there is nobody
+ * left to report to.
+ */
+static void hdl_release_all(void)
+{
+	static const enum hdl_kind order[] = {
+		HDL_MR, HDL_AV, HDL_CQ, HDL_EP, HDL_DOMAIN, HDL_INSTANCE
+	};
+	unsigned pass, n = 0;
+	uint64_t i;
+
+	for (pass = 0; pass < sizeof(order) / sizeof(order[0]); pass++) {
+		for (i = 1; i < HDL_MAX; i++) {
+			void *p = hdl_tbl[i];
+
+			if ((p == NULL) || (hdl_kind[i] != order[pass]))
+				continue;
+
+			switch (order[pass]) {
+			case HDL_MR:
+				(void)uet_mr_disable(p);
+				(void)uet_mr_close(p);
+				break;
+			case HDL_AV:
+				(void)uet_av_remove(p);
+				break;
+			case HDL_CQ:
+				(void)uet_cq_close(p);
+				break;
+			case HDL_EP:
+				(void)uet_ep_close(p);
+				break;
+			case HDL_DOMAIN:
+				(void)uet_domain_close(p);
+				break;
+			case HDL_INSTANCE:
+				(void)uet_finalize(p);
+				break;
+			default:
+				break;
+			}
+			hdl_tbl[i] = NULL;
+			hdl_kind[i] = HDL_NONE;
+			n++;
+		}
+	}
+	if (n > 0)
+		LOG("released %u object%s the host left open\n",
+		    n, (n == 1) ? "" : "s");
+}
+
 static void *hdl_get(shim_handle_t h)
 {
 	if ((h == SHIM_HANDLE_NONE) || (h >= HDL_MAX))
@@ -134,6 +220,7 @@ static void hdl_del(shim_handle_t h)
 {
 	if ((h != SHIM_HANDLE_NONE) && (h < HDL_MAX)) {
 		hdl_tbl[h] = NULL;
+		hdl_kind[h] = HDL_NONE;
 		if (h < hdl_next)
 			hdl_next = h;         /* rewind so the slot is reused */
 	}
@@ -553,7 +640,7 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 
 		rsp->ret = uet_initialize(&uh);
 		if (rsp->ret == 0)
-			rsp->h1 = hdl_put(uh);
+			rsp->h1 = hdl_put(uh, HDL_INSTANCE);
 		break;
 	}
 
@@ -634,7 +721,7 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 				      (void *)(uintptr_t)req->a3,
 				      guest_eq_cb, guest_eq_err_cb, &dh);
 		if (rsp->ret == 0) {
-			rsp->h1 = hdl_put(dh);
+			rsp->h1 = hdl_put(dh, HDL_DOMAIN);
 			/* keep it: uet_domain() retained this exact object
 			 * and the application may still mutate its twin on
 			 * the host - see dom_info_refresh() */
@@ -690,7 +777,7 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 					(struct fid_ep *)(uintptr_t)req->a1,
 					(void *)(uintptr_t)req->a2, &eh);
 		if (rsp->ret == 0)
-			rsp->h1 = hdl_put(eh);
+			rsp->h1 = hdl_put(eh, HDL_EP);
 		else
 			fi_freeinfo(info);
 		break;
@@ -719,7 +806,7 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 					  req->a2,
 					  (void *)(uintptr_t)req->a3, &ch);
 		if (rsp->ret == 0) {
-			rsp->h2 = hdl_put(ch);
+			rsp->h2 = hdl_put(ch, HDL_CQ);
 			/* remember this queue's stride; CQ_READ needs it */
 			if (rsp->h2 < HDL_MAX)
 				cq_entry_sz[rsp->h2] = (attr != NULL) ?
@@ -768,7 +855,7 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		rsp->ret = uet_mr_reg(hdl_get(req->h1), buf, len,
 				      req->a2, req->a3, req->a4, NULL, &mh);
 		if (rsp->ret == 0)
-			rsp->h2 = hdl_put(mh);
+			rsp->h2 = hdl_put(mh, HDL_MR);
 		break;
 	}
 
@@ -818,7 +905,7 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		 */
 		rsp->ret = uet_av_insert(hdl_get(req->h1), a, &ah);
 		if (rsp->ret == 0) {
-			rsp->h2 = hdl_put(ah);
+			rsp->h2 = hdl_put(ah, HDL_AV);
 			LOG("AV_INSERT    -> handle=%llu pid_on_fep=%u "
 			    "start_index=%u num_indices=%u initiator=%u\n",
 			    (unsigned long long)rsp->h2,
@@ -1410,6 +1497,8 @@ int main(int argc, char **argv)
 
 			if (rc != 0) {
 				LOG("disconnected: %s\n", strerror(-rc));
+				rx_forget_all();
+				hdl_release_all();
 				break;
 			}
 			calls++;
