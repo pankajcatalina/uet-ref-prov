@@ -404,6 +404,30 @@ static unsigned shim_timeout_secs(void)
 	return t;
 }
 
+/*
+ * How long the GUEST waits for the host to stamp the regions. Separate
+ * from SHM_TIMEOUT_DEFAULT, and infinite by default, because the two
+ * waits are nothing alike: a message that never arrives means the peer
+ * died and must be given up on, but the guest shim is a daemon started
+ * before the workload and has every reason to sit waiting for a container
+ * that has not been launched yet.
+ *
+ * ABI 5 did not need this - the guest claimed the region and the HOST
+ * waited. ABI 6 inverted that, because only the host knows which file is
+ * which, and the ordering requirement moved with it.
+ */
+static unsigned shim_discover_secs(void)
+{
+	static unsigned t = (unsigned)-1;
+
+	if (t == (unsigned)-1) {
+		const char *e = getenv("UET_SHIM_DISCOVER_TIMEOUT");
+
+		t = (e != NULL) ? (unsigned)strtoul(e, NULL, 0) : 0;
+	}
+	return t;
+}
+
 static double now_secs(void)
 {
 	struct timespec ts;
@@ -667,7 +691,10 @@ static int probe_and_bind(char path[][256], size_t n)
 	 * first, so finding nothing yet is normal.
 	 */
 	t0  = now_secs();
-	tmo = shim_timeout_secs();
+	tmo = shim_discover_secs();
+	fprintf(stderr, "[shim/shm] waiting for the host to stamp the "
+			"regions%s...\n",
+		(tmo != 0) ? "" : " (no timeout)");
 	for (;;) {
 		unsigned seen = 0;
 
@@ -684,8 +711,12 @@ static int probe_and_bind(char path[][256], size_t n)
 			fprintf(stderr, "[shim/shm] timed out after %us: the "
 					"host shim has not stamped the "
 					"regions.\n"
-				"           Start the host side, then "
-				"retry.\n", tmo);
+				"           ABI 6 inverted the handshake - "
+				"the HOST stamps and the guest discovers, so "
+				"the\n"
+				"           container side must run first. "
+				"Unset UET_SHIM_DISCOVER_TIMEOUT to wait "
+				"indefinitely.\n", tmo);
 			rc = -ETIMEDOUT;
 			goto out;
 		}
