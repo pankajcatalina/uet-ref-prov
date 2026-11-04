@@ -475,6 +475,21 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		 * domain retained by pointer, so apply any change the
 		 * application made since uet_domain() */
 		dom_info_refresh(req->h1, (struct shim_fi_info *)g_in);
+
+		/*
+		 * a4 is the job-wide rank, or SHIM_RANK_UNKNOWN. The
+		 * reference stack derives its own identity in
+		 * uet_addr_resolution(), so nothing here consumes it - but a
+		 * device-backed implementation needs it to make the
+		 * Initiator ID unique across the job, and logging it means
+		 * the two sides can be compared without a debugger.
+		 */
+		if (req->a4 == SHIM_RANK_UNKNOWN)
+			LOG("ENDPOINT     rank=unknown\n");
+		else
+			LOG("ENDPOINT     rank=%llu\n",
+			    (unsigned long long)req->a4);
+
 		rsp->ret = uet_endpoint(hdl_get(req->h1), info,
 					(struct fid_ep *)(uintptr_t)req->a1,
 					(void *)(uintptr_t)req->a2, &eh);

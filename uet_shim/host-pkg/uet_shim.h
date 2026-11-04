@@ -31,7 +31,7 @@
  * side's dependencies in scope.
  */
 
-#define SHIM_ABI_VERSION   6u            /* bump on ANY change below */
+#define SHIM_ABI_VERSION   7u            /* bump on ANY change below */
 #define SHIM_MAGIC         0x53484d31u   /* "SHM1", in every message */
 
 /* ---------------------------------------------------------------- regions
@@ -282,6 +282,10 @@ const char *shim_op_name(uint32_t op);
 typedef uint64_t shim_handle_t;
 
 #define SHIM_HANDLE_NONE  ((shim_handle_t)0)     /* matches UET_NULL_HANDLE */
+
+/* ENDPOINT's a4 when the launcher told us nothing. Not 0, because 0 is a
+ * perfectly good rank. */
+#define SHIM_RANK_UNKNOWN ((uint64_t)~0ULL)
 #define shim_h2p(h)       ((void *)(uintptr_t)(h))
 #define shim_p2h(p)       ((shim_handle_t)(uintptr_t)(p))
 
@@ -405,9 +409,11 @@ struct shim_fi_info {
 };
 
 /* An iovec entry as offset+len: a host pointer means nothing in the guest.
- * NOTE the offset is into the REQUEST PAYLOAD, not into the shared region.
- * That distinction is the whole difference between today's copy-based
- * design and the future zero-copy arena. */
+ *
+ * off is relative to hdr.off, so the segment lives at hdr.off + iov[i].off
+ * in the arena that hdr.off's tag names. ABI 1 made it an offset into the
+ * request PAYLOAD, because bulk data travelled inline; ABI 2 moved bulk to
+ * the arena and this moved with it. */
 struct shim_iov {
 	uint64_t off;
 	uint64_t len;
@@ -476,7 +482,7 @@ struct shim_atomic_args {
 };
 
 /* --------------------------------------------------------------- messages
- * Fixed 72-byte header, then payload_len bytes.
+ * Fixed 80-byte header, then payload_len bytes.
  *
  * Field order is deliberate: four uint32_t first fill exactly 16 bytes, so
  * every 8-byte field lands naturally aligned and there is NO implicit
@@ -517,7 +523,14 @@ struct shim_hdr {
  *               same hot path as CQ_READ - see the gap notes at the end of
  *               uet_shim_host.c.
  * ENDPOINT      in:  h1 = domain, a1 = ep token, a2 = context id,
+ *                    a4 = global rank, or SHIM_RANK_UNKNOWN,
  *                    payload = struct shim_fi_info
+ *               The rank is the job-wide one, taken from the launcher. It
+ *               exists so the guest can derive an Initiator ID that is
+ *               unique across the job: every endpoint currently reports
+ *               UET_ADDR_DEF_INITIATOR (16), and only the destination IP
+ *               keeps two nodes apart - which does not generalise past a
+ *               pair.
  *               out: h1 = ep handle
  * EP_ENABLE     in:  h1 = ep
  * EP_CLOSE      in:  h1 = ep
@@ -526,8 +539,13 @@ struct shim_hdr {
  *               out: h2 = cq handle
  * EP_BIND_MR    in:  h1 = ep, h2 = mr, a1 = flags
  * MR_REG        in:  h1 = domain, a1 = len, a2 = access,
- *                    a3 = requested_key, a4 = flags, payload = contents
+ *                    a3 = requested_key, a4 = flags,
+ *                    off = the arena block that IS the region
  *               out: h2 = mr handle
+ *               The guest registers the arena block itself, so a peer's
+ *               RMA write lands in memory the host can already read. ABI 1
+ *               sent the contents as a payload and registered a guest-local
+ *               copy, which made RMA impossible.
  * MR_KEY        in:  h2 = mr        out: ret = key
  * MR_ENABLE     in:  h2 = mr
  * MR_DISABLE    in:  h2 = mr
@@ -536,12 +554,20 @@ struct shim_hdr {
  *               out: h2 = addr handle
  * AV_REMOVE     in:  h2 = addr handle
  * CQ_READ       in:  h1 = cq, a1 = count
- *               out: ret = entries, a1 = entry stride, a2 = rx blob offset,
- *                    payload = entries then received bytes
+ *               out: ret = entries, a1 = entry stride,
+ *                    a2 = total entry bytes (ret * a1),
+ *                    payload = entries, AND NOTHING ELSE
+ *               Received bytes do not ride back here. They landed in the
+ *               arena block the host reserved when it posted the receive.
+ *               ABI 1 appended them, which halved how many completions one
+ *               reply could carry.
  * CQ_READERR    in:  h1 = cq        out: payload = struct fi_cq_err_entry
  * SEND          in:  h1 = ep, h2 = mr, a1 = job_id, a2 = len,
- *                    a3 = addr handle, a4 = context id, payload = data
- * SENDV         as SEND, a2 = iov_count, payload = shim_iov[] then data
+ *                    a3 = addr handle, a4 = context id,
+ *                    off = arena block holding the data
+ * SENDV         as SEND, a2 = iov_count, off = arena block,
+ *                    payload = shim_iov[] only - each entry's off is
+ *                    relative to hdr.off
  * RECV          in:  h1 = ep, h2 = mr, a1 = job_id, a2 = len,
  *                    a3 = src addr handle, a4 = context id
  * TSENDV        as SENDV, payload prefixed by struct shim_tag_args

@@ -921,6 +921,59 @@ int uet_domain_close(uet_domain_handle_t domain_handle)
  * endpoint
  * =================================================================== */
 
+/*
+ * The job-wide rank, for ENDPOINT's a4.
+ *
+ * The guest needs it to derive an Initiator ID that is unique across the
+ * job. Today every endpoint reports UET_ADDR_DEF_INITIATOR (16) and only
+ * the destination IP distinguishes two nodes, which stops working the
+ * moment there is more than one rank per host.
+ *
+ * Taken from the launcher, because nothing below libfabric knows it.
+ * UET_RANK wins so a harness without MPI can still set it; otherwise
+ * whichever launcher variable is present. Resolved once.
+ */
+static uint64_t shim_global_rank(void)
+{
+	static uint64_t rank = SHIM_RANK_UNKNOWN;
+	static bool resolved;
+
+	if (!resolved) {
+		static const char *const vars[] = {
+			"UET_RANK",
+			"OMPI_COMM_WORLD_RANK",
+			"PMI_RANK",
+			"PMIX_RANK",
+			"SLURM_PROCID",
+			NULL
+		};
+		size_t i;
+
+		for (i = 0; vars[i] != NULL; i++) {
+			const char *v = getenv(vars[i]);
+			char *end;
+			unsigned long long n;
+
+			if ((v == NULL) || (*v == '\0'))
+				continue;
+			n = strtoull(v, &end, 10);
+			if (*end != '\0')
+				continue;        /* not a plain number */
+
+			rank = (uint64_t)n;
+			fprintf(stderr, "[shim/host] rank %llu (from %s)\n",
+				(unsigned long long)rank, vars[i]);
+			break;
+		}
+		if (rank == SHIM_RANK_UNKNOWN)
+			fprintf(stderr, "[shim/host] no rank in the "
+				"environment; the guest cannot make the "
+				"Initiator ID unique\n");
+		resolved = true;
+	}
+	return rank;
+}
+
 int uet_endpoint(uet_domain_handle_t domain_handle,
 		 struct fi_info *info, struct fid_ep *ep,
 		 void *context, uet_ep_handle_t *ep_handle)
@@ -931,6 +984,7 @@ int uet_endpoint(uet_domain_handle_t domain_handle,
 
 	h.a1 = shim_p2h(ep);                 /* opaque token */
 	h.a2 = ctx_get(context, NULL, 0);
+	h.a4 = shim_global_rank();
 
 	shim_info_flatten(info, &flat);
 
