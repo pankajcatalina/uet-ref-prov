@@ -464,6 +464,34 @@ static size_t iov_total(const struct iovec *iov, size_t n)
 	return t;
 }
 
+/*
+ * The peer's scatter-gather limit, enforced HERE.
+ *
+ * Whatever is behind the shim advertises it in GETINFO: the in-process
+ * stack says 64, libuet says UET_DEV_WQE_MAX_SGE (4), because that is
+ * what a work request holds. Taking it from the reply rather than
+ * hardcoding one means the same shim is correct over either.
+ *
+ * It has to be checked on THIS side. libuet refuses the post itself, but
+ * ABI 6 posts are asynchronous, so its refusal would arrive after the
+ * application had been told the operation succeeded, and the completion
+ * it is waiting for would never come.
+ *
+ * Zero until GETINFO has been answered, which means no limit - nothing
+ * can have been posted yet anyway.
+ */
+static size_t g_peer_iov_limit;
+
+static int iov_dev_limit(size_t n)
+{
+	if ((g_peer_iov_limit == 0) || (n <= g_peer_iov_limit))
+		return 0;
+
+	fprintf(stderr, "[shim/host] %zu segments, but the peer takes at "
+		"most %zu - split the operation\n", n, g_peer_iov_limit);
+	return -FI_EINVAL;
+}
+
 static int stage_iov(const struct iovec *iov, size_t n,
 		     struct shim_iov *tbl, struct stage *st, int copy_in)
 {
@@ -928,6 +956,12 @@ int uet_getinfo(uet_handle_t handle, struct uet_addr *node,
 		fprintf(stderr, "[shim/host] getinfo: short reply %u\n", rlen);
 		return -FI_EIO;
 	}
+
+	/* the smaller of the two bounds every vectored call */
+	g_peer_iov_limit = (flat.tx_iov_limit < flat.rx_iov_limit) ?
+			   flat.tx_iov_limit : flat.rx_iov_limit;
+	fprintf(stderr, "[shim/host] peer iov limit: %zu segments\n",
+		g_peer_iov_limit);
 
 	*info = shim_info_build(&flat);
 	return (*info != NULL) ? 0 : -FI_ENOMEM;
@@ -1534,6 +1568,10 @@ ssize_t uet_sendv(uet_ep_handle_t ep_handle, uint32_t job_id,
 	/* The segment table still travels inline - it is 16 bytes an entry
 	 * and at most SHIM_MAX_IOV of them. Only the DATA moved to the
 	 * arena, and the offsets in tbl are now arena-relative. */
+	rc = iov_dev_limit(iov_count);
+	if (rc != 0)
+		return rc;
+
 	rc = stage_iov(iov, iov_count, tbl, &st, 1);
 	if (rc != 0)
 		return rc;
@@ -1612,6 +1650,10 @@ ssize_t uet_tsendv(uet_ep_handle_t ep_handle, uint32_t job_id,
 	pkt.ta.tag = tag;
 	pkt.ta.ignore = 0;
 
+	rc = iov_dev_limit(iov_count);
+	if (rc != 0)
+		return rc;
+
 	rc = stage_iov(iov, iov_count, pkt.tbl, &st, 1);
 	if (rc != 0)
 		return rc;
@@ -1654,6 +1696,10 @@ ssize_t uet_trecvv(uet_ep_handle_t ep_handle, uint32_t job_id,
 	pkt.ta.ignore = ignore;
 
 	/* a receive sends no data, only the SHAPE of the target buffers */
+	rc = iov_dev_limit(iov_count);
+	if (rc != 0)
+		return rc;
+
 	rc = stage_iov(iov, iov_count, pkt.tbl, &st, 0);
 	if (rc != 0)
 		return rc;
@@ -1733,6 +1779,10 @@ ssize_t uet_recvv(uet_ep_handle_t ep_handle, uint32_t job_id,
 	struct iovec *keep;
 	struct stage st;
 	int rc;
+
+	rc = iov_dev_limit(iov_count);
+	if (rc != 0)
+		return rc;
 
 	rc = stage_iov(iov, iov_count, tbl, &st, 0);
 	if (rc != 0)

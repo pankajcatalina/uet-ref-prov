@@ -70,6 +70,10 @@ static unsigned long g_log_calls = 64;
  */
 #define HDL_MAX 1024
 
+/* Mirrors the host's CTX_MAX: context ids are allocated there and used
+ * as the key here, so the two must agree or a valid id indexes nothing. */
+#define CTX_MAX_GUEST 4096
+
 static void *hdl_tbl[HDL_MAX];
 
 /*
@@ -201,6 +205,86 @@ static size_t cq_fmt_size(enum fi_cq_format fmt)
  * offset comes from the other side of a boundary we do not control: a
  * corrupt or hostile value must become -EINVAL, never a wild pointer.
  */
+/* ------------------------------------------------------------- mirror
+ *
+ * The device DMAs from guest RAM the driver has pinned with
+ * pin_user_pages_fast(FOLL_LONGTERM). That call refuses an ivshmem
+ * mapping, which the kernel marks VM_IO|VM_PFNMAP - so an arena pointer
+ * handed to libuet fails with -EFAULT, either in REG_MR or in the
+ * temporary MR libuet registers for a buffer that has none.
+ *
+ * So the guest keeps one ordinary buffer per data arena, the same size,
+ * and works at the same offset in both: mirror byte N corresponds to
+ * arena byte N. Sends copy arena -> mirror before posting; receives post
+ * into the mirror and copy mirror -> arena when the completion is read.
+ *
+ * The rule the rest of this file follows: arena_in() is for COPYING
+ * ONLY, and mirror_in() is what goes to libuet. No arena pointer may
+ * reach a uet_* call.
+ *
+ * The RMA and atomic handlers still form arena pointers and pass them
+ * to uet_write(), uet_read() and the atomics. That is safe in both
+ * builds and in neither case reaches libuet:
+ *
+ *   uet_shim_guest      links the in-process stack, which reads and
+ *                       writes the arena directly and wants exactly
+ *                       that pointer;
+ *   uet_shim_guest_dev  links libuet, where all ten of those symbols
+ *                       come from uet_shim_stubs.c and return
+ *                       -FI_ENOSYS before touching the pointer.
+ *
+ * They would have to be mirrored before the device implements RMA. An
+ * inbound RMA write lands wherever the region was registered, so with a
+ * mirror the host would never see it - that needs a sync point the
+ * messaging path does not, and is out of scope here.
+ */
+static struct {
+	uint8_t *base;
+	size_t   size;
+} g_mirror[SHIM_REG_MAX];
+
+static int mirror_init(void)
+{
+	static const unsigned regs[] = { SHIM_REG_ARENA_H, SHIM_REG_ARENA_G };
+	size_t i;
+
+	for (i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+		unsigned r = regs[i];
+		size_t len = shim_arena_size(r);
+		void *p = NULL;
+
+		if (len == 0) {
+			LOG("arena %s is not mapped\n", shim_region_name(r));
+			return -ENODEV;
+		}
+		if (posix_memalign(&p, 4096, len) != 0) {
+			LOG("cannot allocate a %zu MiB mirror for %s\n",
+			    len >> 20, shim_region_name(r));
+			return -ENOMEM;
+		}
+		/*
+		 * Pinned up front, not on demand. The driver pins these
+		 * pages for every registration anyway, and a major fault on
+		 * the data path can exceed the PDS retransmit timeout and
+		 * look exactly like packet loss.
+		 */
+		if (mlock(p, len) != 0) {
+			LOG("mlock of the %zu MiB %s mirror failed: %s\n",
+			    len >> 20, shim_region_name(r), strerror(errno));
+			LOG("    raise RLIMIT_MEMLOCK (ulimit -l) - the "
+			    "device cannot DMA from unpinned memory\n");
+			free(p);
+			return -ENOMEM;
+		}
+
+		g_mirror[r].base = p;
+		g_mirror[r].size = len;
+		LOG("mirror %s: %p, %zu MiB, pinned\n",
+		    shim_region_name(r), p, len >> 20);
+	}
+	return 0;
+}
+
 static void *arena_in(uint32_t op, uint64_t off, size_t len,
 		      int64_t *ret)
 {
@@ -246,6 +330,118 @@ static void *arena_in(uint32_t op, uint64_t off, size_t len,
 		*ret = -EINVAL;
 	}
 	return p;
+}
+
+/*
+ * The same offset in the mirror. Validated exactly as arena_in() does -
+ * tag in range, tag allowed for this opcode, range inside the region -
+ * because the mirror and the arena are the same size and an offset that
+ * is unsafe in one is unsafe in the other.
+ *
+ * NULL without touching *ret means the "no buffer" sentinel, as above.
+ */
+static void *mirror_in(uint32_t op, uint64_t off, size_t len, int64_t *ret)
+{
+	if (arena_in(op, off, len, ret) == NULL)
+		return NULL;
+
+	return g_mirror[SHIM_OFF_REG(off)].base + SHIM_OFF_VAL(off);
+}
+
+/*
+ * Where a posted receive will land, remembered until its completion.
+ *
+ * Keyed on the host's context id, which is unique while in flight -
+ * ctx_tbl[] on that side guarantees it. At most SHIM_DEV_MAX_SGE
+ * segments, because layer 1 refuses more before posting.
+ */
+struct rx_rec {
+	int      used;
+	unsigned n;
+	struct {
+		uint64_t off;              /* tagged, as it arrived */
+		size_t   len;
+	} seg[SHIM_DEV_MAX_SGE];
+};
+
+static struct rx_rec g_rx[CTX_MAX_GUEST];
+
+static void rx_remember(uint64_t ctx, const struct iovec *iov, size_t n,
+			const uint64_t *offs)
+{
+	struct rx_rec *r;
+	size_t i;
+
+	if ((ctx == 0) || (ctx >= CTX_MAX_GUEST) || (n > SHIM_DEV_MAX_SGE))
+		return;
+
+	r = &g_rx[ctx];
+	memset(r, 0, sizeof(*r));
+	for (i = 0; i < n; i++) {
+		r->seg[i].off = offs[i];
+		r->seg[i].len = iov[i].iov_len;
+	}
+	r->n = (unsigned)n;
+	r->used = 1;
+}
+
+/*
+ * Copy what arrived back out to the arena, newest-first across the
+ * segment list, and retire the record.
+ *
+ * got bounds the copy: a truncated message delivers fewer bytes than
+ * were posted, and copying the posted length would publish whatever the
+ * mirror held before.
+ */
+static void rx_deliver(uint64_t ctx, size_t got)
+{
+	struct rx_rec *r;
+	unsigned i;
+
+	if ((ctx == 0) || (ctx >= CTX_MAX_GUEST))
+		return;
+
+	r = &g_rx[ctx];
+	if (!r->used)
+		return;
+
+	for (i = 0; (i < r->n) && (got > 0); i++) {
+		size_t take = (got < r->seg[i].len) ? got : r->seg[i].len;
+		int64_t ignored = 0;
+		void *dst = arena_in(SHIM_RECV, r->seg[i].off, take, &ignored);
+		void *src = mirror_in(SHIM_RECV, r->seg[i].off, take,
+				      &ignored);
+
+		if ((dst != NULL) && (src != NULL) && (take > 0))
+			memcpy(dst, src, take);
+		got -= take;
+	}
+	r->used = 0;
+}
+
+static void rx_forget_all(void)
+{
+	memset(g_rx, 0, sizeof(g_rx));
+}
+
+/* Copy one segment arena -> mirror before a send. The host restaged the
+ * bytes into the arena; the device can only read the mirror. */
+static void mirror_stage(uint32_t op, uint64_t off, size_t len)
+{
+	int64_t ignored = 0;
+	void *src = arena_in(op, off, len, &ignored);
+	void *dst = mirror_in(op, off, len, &ignored);
+
+	if ((src != NULL) && (dst != NULL) && (len > 0))
+		memcpy(dst, src, len);
+}
+
+/* The single-buffer receive case: one segment. */
+static void rx_remember1(uint64_t ctx, uint64_t off, size_t len)
+{
+	struct iovec one = { NULL, len };
+
+	rx_remember(ctx, &one, 1, &off);
 }
 
 /* ------------------------------------------------------------- eq events
@@ -505,6 +701,9 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		break;
 
 	case SHIM_EP_CLOSE:
+		/* receives posted on this endpoint will never complete, so
+		 * their records would otherwise sit until the ids wrapped */
+		rx_forget_all();
 		rsp->ret = uet_ep_close(hdl_get(req->h1));
 		hdl_del(req->h1);
 		break;
@@ -552,9 +751,19 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		 * Nothing is allocated now, so nothing leaks on close either.
 		 */
 		rsp->ret = 0;
-		buf = arena_in(req->op, req->off, len, &rsp->ret);
+		/*
+		 * Register the MIRROR, never the arena: the driver pins
+		 * with FOLL_LONGTERM and an ivshmem mapping is
+		 * VM_IO|VM_PFNMAP, which pinning refuses outright. No copy
+		 * is needed here - the host restages every send before
+		 * posting it.
+		 */
+		buf = mirror_in(req->op, req->off, len, &rsp->ret);
 		if (rsp->ret != 0)
 			break;
+
+		LOG("MR_REG       mirror=%p off=0x%016llx len=%zu\n",
+		    buf, (unsigned long long)req->off, len);
 
 		rsp->ret = uet_mr_reg(hdl_get(req->h1), buf, len,
 				      req->a2, req->a3, req->a4, NULL, &mh);
@@ -667,25 +876,69 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		 * completions one reply could carry, and the rx bookkeeping
 		 * that went with it.
 		 */
+		/*
+		 * A receive landed in the mirror, so publish it to the
+		 * arena before the host sees the completion that says it
+		 * arrived. entry.len bounds the copy: a truncated message
+		 * delivers fewer bytes than were posted, and copying the
+		 * posted length would publish whatever the mirror held
+		 * before.
+		 *
+		 * flags and len exist from FI_CQ_FORMAT_MSG upward. Under
+		 * FI_CQ_FORMAT_CONTEXT there is neither, and nothing can be
+		 * copied back - the provider uses TAGGED and uet.c uses
+		 * DATA, so this is a diagnostic rather than a path.
+		 */
+		if (entry_sz >= sizeof(struct fi_cq_msg_entry)) {
+			ssize_t k;
+
+			for (k = 0; k < n; k++) {
+				const struct fi_cq_msg_entry *e =
+					(const void *)((char *)g_out +
+						       (size_t)k * entry_sz);
+
+				if (e->flags & FI_RECV)
+					rx_deliver((uint64_t)(uintptr_t)
+						   e->op_context, e->len);
+			}
+		} else {
+			static int warned;
+
+			if (!warned++)
+				LOG("CQ format %zu carries no flags or len; "
+				    "received data cannot be published to "
+				    "the arena\n", entry_sz);
+		}
+
 		rsp->a1 = entry_sz;
 		rsp->a2 = (size_t)n * entry_sz;
 		rsp->payload_len = (uint32_t)((size_t)n * entry_sz);
 		break;
 	}
 
-	case SHIM_CQ_READERR:
-		rsp->ret = uet_cq_readerr(hdl_get(req->h1),
-					  (struct fi_cq_err_entry *)g_out);
-		if (rsp->ret > 0)
+	case SHIM_CQ_READERR: {
+		struct fi_cq_err_entry *ee = (struct fi_cq_err_entry *)g_out;
+
+		rsp->ret = uet_cq_readerr(hdl_get(req->h1), ee);
+		if (rsp->ret > 0) {
+			/* A failure can still have delivered part of a
+			 * message - truncation is the obvious one - so the
+			 * same copy-back applies, bounded by err.len. */
+			if ((ee->flags & FI_RECV) && (ee->len > 0))
+				rx_deliver((uint64_t)(uintptr_t)
+					   ee->op_context, ee->len);
 			rsp->payload_len = sizeof(struct fi_cq_err_entry);
+		}
 		break;
+	}
 
 	/* ------------------------------------------------- data path */
 	case SHIM_SEND: {
 		void *buf;
 
 		rsp->ret = 0;
-		buf = arena_in(req->op, req->off, req->a2, &rsp->ret);
+		buf = mirror_in(req->op, req->off, req->a2, &rsp->ret);
+		mirror_stage(req->op, req->off, req->a2);
 		if (rsp->ret != 0)
 			break;
 		/* The arena block belongs to this operation until its
@@ -702,6 +955,7 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 	case SHIM_SENDV: {
 		struct shim_iov *tbl = (struct shim_iov *)g_in;
 		struct iovec iov[SHIM_MAX_IOV];
+		uint64_t segoff[SHIM_MAX_IOV];
 		size_t cnt = req->a2, i;
 
 		/* bounds the stack array above: without this the peer
@@ -712,14 +966,17 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		}
 		rsp->ret = 0;
 		for (i = 0; i < cnt; i++) {
-			iov[i].iov_base = arena_in(req->op, req->off + tbl[i].off,
-						   tbl[i].len, &rsp->ret);
+			segoff[i] = req->off + tbl[i].off;
+			iov[i].iov_base = mirror_in(req->op, segoff[i],
+						    tbl[i].len, &rsp->ret);
 			if (rsp->ret != 0)
 				break;
 			iov[i].iov_len = tbl[i].len;
 		}
 		if (i != cnt)
 			break;
+		for (i = 0; i < cnt; i++)
+			mirror_stage(req->op, segoff[i], tbl[i].len);
 		rsp->ret = uet_sendv(hdl_get(req->h1), (uint32_t)req->a1,
 				     iov, cnt, hdl_get(req->h2),
 				     hdl_get(req->a3),
@@ -734,7 +991,8 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		void *buf;
 
 		rsp->ret = 0;
-		buf = arena_in(req->op, req->off, req->a2, &rsp->ret);
+		buf = mirror_in(req->op, req->off, req->a2, &rsp->ret);
+		rx_remember1(req->a4, req->off, req->a2);
 		if (rsp->ret != 0)
 			break;
 		rsp->ret = uet_recv(hdl_get(req->h1), (uint32_t)req->a1,
@@ -749,6 +1007,7 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		struct shim_iov *tbl =
 			(struct shim_iov *)(g_in + sizeof(*ta));
 		struct iovec iov[SHIM_MAX_IOV];
+		uint64_t segoff[SHIM_MAX_IOV];
 		size_t cnt = req->a2, i;
 
 		if (cnt > SHIM_MAX_IOV) {
@@ -757,14 +1016,17 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		}
 		rsp->ret = 0;
 		for (i = 0; i < cnt; i++) {
-			iov[i].iov_base = arena_in(req->op, req->off + tbl[i].off,
-						   tbl[i].len, &rsp->ret);
+			segoff[i] = req->off + tbl[i].off;
+			iov[i].iov_base = mirror_in(req->op, segoff[i],
+						    tbl[i].len, &rsp->ret);
 			if (rsp->ret != 0)
 				break;
 			iov[i].iov_len = tbl[i].len;
 		}
 		if (i != cnt)
 			break;
+		for (i = 0; i < cnt; i++)
+			mirror_stage(req->op, segoff[i], tbl[i].len);
 		rsp->ret = uet_tsendv(hdl_get(req->h1), (uint32_t)req->a1,
 				      iov, cnt, hdl_get(req->h2),
 				      hdl_get(req->a3), ta->tag,
@@ -777,6 +1039,7 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		struct shim_iov *tbl =
 			(struct shim_iov *)(g_in + sizeof(*ta));
 		struct iovec iov[SHIM_MAX_IOV];
+		uint64_t segoff[SHIM_MAX_IOV];
 		size_t cnt = req->a2, i;
 
 		if (cnt > SHIM_MAX_IOV) {
@@ -785,14 +1048,16 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		}
 		rsp->ret = 0;
 		for (i = 0; i < cnt; i++) {
-			iov[i].iov_base = arena_in(req->op, req->off + tbl[i].off,
-						   tbl[i].len, &rsp->ret);
+			segoff[i] = req->off + tbl[i].off;
+			iov[i].iov_base = mirror_in(req->op, segoff[i],
+						    tbl[i].len, &rsp->ret);
 			if (rsp->ret != 0)
 				break;
 			iov[i].iov_len = tbl[i].len;
 		}
 		if (i != cnt)
 			break;
+		rx_remember(req->a4, iov, cnt, segoff);
 		rsp->ret = uet_trecvv(hdl_get(req->h1), (uint32_t)req->a1,
 				      iov, cnt, hdl_get(req->h2),
 				      hdl_get(req->a3), ta->tag, ta->ignore,
@@ -804,6 +1069,7 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 	case SHIM_RECVV: {
 		struct shim_iov *tbl = (struct shim_iov *)g_in;
 		struct iovec iov[SHIM_MAX_IOV];
+		uint64_t segoff[SHIM_MAX_IOV];
 		size_t cnt = req->a2, i;
 
 		if (cnt > SHIM_MAX_IOV) {
@@ -812,14 +1078,16 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 		}
 		rsp->ret = 0;
 		for (i = 0; i < cnt; i++) {
-			iov[i].iov_base = arena_in(req->op, req->off + tbl[i].off,
-						   tbl[i].len, &rsp->ret);
+			segoff[i] = req->off + tbl[i].off;
+			iov[i].iov_base = mirror_in(req->op, segoff[i],
+						    tbl[i].len, &rsp->ret);
 			if (rsp->ret != 0)
 				break;
 			iov[i].iov_len = tbl[i].len;
 		}
 		if (i != cnt)
 			break;
+		rx_remember(req->a4, iov, cnt, segoff);
 		rsp->ret = uet_recvv(hdl_get(req->h1), (uint32_t)req->a1,
 				     iov, cnt, hdl_get(req->h2),
 				     hdl_get(req->a3),
@@ -836,7 +1104,8 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 			break;
 		}
 		rsp->ret = 0;
-		buf = arena_in(req->op, req->off, req->a2, &rsp->ret);
+		buf = mirror_in(req->op, req->off, req->a2, &rsp->ret);
+		mirror_stage(req->op, req->off, req->a2);
 		if (rsp->ret != 0)
 			break;
 		rsp->ret = uet_tsend(hdl_get(req->h1), (uint32_t)req->a1,
@@ -855,7 +1124,8 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 			break;
 		}
 		rsp->ret = 0;
-		buf = arena_in(req->op, req->off, req->a2, &rsp->ret);
+		buf = mirror_in(req->op, req->off, req->a2, &rsp->ret);
+		rx_remember1(req->a4, req->off, req->a2);
 		if (rsp->ret != 0)
 			break;
 		rsp->ret = uet_trecv(hdl_get(req->h1), (uint32_t)req->a1,
@@ -1109,6 +1379,12 @@ int main(int argc, char **argv)
 	if (shim_arena_attach() != 0) {
 		LOG("%s provides no shared region; the arena is required "
 		    "by ABI %u\n", shim_xport_name(), SHIM_ABI_VERSION);
+		return 1;
+	}
+
+	if (mirror_init() != 0) {
+		LOG("cannot set up the arena mirrors; the device can only "
+		    "DMA from pinned guest memory\n");
 		return 1;
 	}
 

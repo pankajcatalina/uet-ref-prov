@@ -239,6 +239,18 @@ enum shim_op {
 #define SHIM_ARENA_M_H     SHIM_ARENA_BIT(SHIM_REG_ARENA_H)
 #define SHIM_ARENA_M_G     SHIM_ARENA_BIT(SHIM_REG_ARENA_G)
 
+/*
+ * The device's scatter-gather limit (UET_DEV_WQE_MAX_SGE). Layer 1
+ * enforces it, because layer 2 cannot: ABI 6 posts are asynchronous, so a
+ * refusal there would arrive after the application had been told the
+ * operation succeeded. Rejecting at the call keeps -FI_EINVAL synchronous
+ * and in front of the caller.
+ *
+ * SHIM_MAX_IOV stays 64 - the protocol can carry that many, and uet.c's
+ * iov_mode uses them against the in-process stack.
+ */
+#define SHIM_DEV_MAX_SGE   4
+
 /* Which opcodes prefix their payload with struct shim_tag_args. Kept
  * beside the IDL that says so, rather than as a list in one .c file. */
 static inline int shim_op_has_tag_args(uint32_t op)
