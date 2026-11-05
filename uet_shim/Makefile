@@ -109,8 +109,14 @@ LIBUET ?= /opt/libuet
 uet_shim_stubs.o: uet_shim_stubs.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# Its own object: SHIM_BACKEND_LIBUET drops the UET_IFNAME requirement,
+# since over libuet the DEVICE does the networking and the guest never
+# opens a raw socket.
+uet_shim_guest_dev.o: uet_shim_guest.c
+	$(CC) $(CFLAGS) -DSHIM_BACKEND_LIBUET -c $< -o $@
+
 guest-dev: uet_shim_guest_dev
-uet_shim_guest_dev: uet_shim_guest.o uet_shim_stubs.o $(COMMON)
+uet_shim_guest_dev: uet_shim_guest_dev.o uet_shim_stubs.o $(COMMON)
 	@test -f $(LIBUET)/libuet.so || { \
 		echo "no libuet.so under LIBUET=$(LIBUET)"; \
 		echo "  make guest-dev LIBUET=/path/to/libuet"; exit 1; }

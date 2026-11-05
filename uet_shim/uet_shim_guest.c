@@ -1445,11 +1445,19 @@ int main(int argc, char **argv)
 			g_log_calls = strtoul(s, NULL, 0);
 	}
 
+	/*
+	 * Only the in-process stack needs an interface: it opens a raw
+	 * AF_PACKET socket on it. Over libuet the device does the
+	 * networking - it has its own netdev on the QEMU command line -
+	 * so demanding one here would refuse to start for no reason.
+	 */
+#ifndef SHIM_BACKEND_LIBUET
 	if (getenv("UET_IFNAME") == NULL) {
 		fprintf(stderr, "[shim/guest] UET_IFNAME is not set - the "
 				"stack will fail to open its raw socket\n");
 		return 1;
 	}
+#endif
 
 	signal(SIGINT, on_sigint);
 	signal(SIGTERM, on_sigint);
@@ -1476,8 +1484,8 @@ int main(int argc, char **argv)
 	}
 
 	LOG("ready on %s (ifname=%s pds=%s)\n",
-	    shim_xport_name(), getenv("UET_IFNAME"),
-	    getenv("UET_PDS") ? getenv("UET_PDS") : "sng");
+	    shim_xport_name(), getenv("UET_IFNAME") ? getenv("UET_IFNAME") : "none (device)",
+	    getenv("UET_PDS") ? getenv("UET_PDS") : "default" ? getenv("UET_PDS") ? getenv("UET_PDS") : "default" : "sng");
 
 	/* Re-accept after each host disconnect, so the container can be
 	 * rerun repeatedly without touching the VM. */
