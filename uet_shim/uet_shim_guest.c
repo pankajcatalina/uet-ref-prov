@@ -822,6 +822,44 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 			(req->payload_len >= sizeof(struct fi_cq_attr)) ?
 			(struct fi_cq_attr *)g_in : NULL;
 
+		/*
+		 * PIN THE FORMAT BEFORE BINDING, or the backend and we pick
+		 * different strides for the same queue.
+		 *
+		 * FI_CQ_FORMAT_UNSPEC means "the provider chooses", so each
+		 * implementation is free to choose differently - and they
+		 * do. libuet's uet_ep_bind_cq() falls to
+		 * sizeof(struct fi_cq_entry) (8); cq_fmt_size() below falls
+		 * to sizeof(struct fi_cq_tagged_entry) (48). We then told
+		 * the host to read 48-byte entries out of a queue written in
+		 * 8-byte ones: op_context is the first field so it survived,
+		 * flags and len came from the bytes after it. flags never
+		 * carried FI_RECV, so rx_deliver() never ran, received data
+		 * stayed in the mirror, and the application read whatever
+		 * its buffer held before - zeroes.
+		 *
+		 * Choosing here removes the disagreement by construction,
+		 * whatever any backend's default happens to be. TAGGED is
+		 * the superset, and the copy-back needs flags and len at
+		 * minimum.
+		 */
+		if (attr != NULL) {
+			switch (attr->format) {
+			case FI_CQ_FORMAT_CONTEXT:
+			case FI_CQ_FORMAT_MSG:
+			case FI_CQ_FORMAT_DATA:
+			case FI_CQ_FORMAT_TAGGED:
+				break;
+			default:
+				LOG("EP_BIND_CQ   format %d is not one we "
+				    "know; pinning it to TAGGED so our stride "
+				    "and the backend's cannot differ\n",
+				    (int)attr->format);
+				attr->format = FI_CQ_FORMAT_TAGGED;
+				break;
+			}
+		}
+
 		rsp->ret = uet_ep_bind_cq(hdl_get(req->h1), attr,
 					  (struct fid_cq *)(uintptr_t)req->a1,
 					  req->a2,
@@ -833,6 +871,14 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 				cq_entry_sz[rsp->h2] = (attr != NULL) ?
 					cq_fmt_size(attr->format) :
 					sizeof(struct fi_cq_tagged_entry);
+			if (g_verbose)
+				LOG("EP_BIND_CQ   cq=%llu format=%d stride=%zu "
+				    "flags=0x%llx\n",
+				    (unsigned long long)rsp->h2,
+				    (attr != NULL) ? (int)attr->format : -1,
+				    (rsp->h2 < HDL_MAX) ?
+					cq_entry_sz[rsp->h2] : 0,
+				    (unsigned long long)req->a2);
 		}
 		break;
 	}
