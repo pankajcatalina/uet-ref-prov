@@ -918,6 +918,31 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 			else
 				free(a);   /* table full: ah is unusable */
 		} else {
+			/*
+			 * Decode it on FAILURE too. uet_embed_av_insert()
+			 * answers a flat -FI_EINVAL for four different
+			 * reasons - a length that is not sizeof(struct
+			 * uet_addr), ver != UET_ADDR_VERSION, no
+			 * UET_ADDR_FA_V, or a family this NIC has no
+			 * address in - and the generic failure line shows
+			 * none of them. Printing the address says which,
+			 * and an all-zero one says the caller never filled
+			 * it in rather than filling it in wrongly.
+			 */
+			LOG("AV_INSERT    FAILED ret=%lld: ver=%u flags=0x%02x "
+			    "fep_cap=0x%04x ipv4=%u.%u.%u.%u pid_on_fep=%u "
+			    "start_index=%u num_indices=%u initiator=%u\n",
+			    (long long)rsp->ret,
+			    (unsigned)a->ver, (unsigned)a->flags,
+			    (unsigned)a->fep_cap,
+			    (unsigned)((a->fa.v4 >> 24) & 0xff),
+			    (unsigned)((a->fa.v4 >> 16) & 0xff),
+			    (unsigned)((a->fa.v4 >> 8) & 0xff),
+			    (unsigned)(a->fa.v4 & 0xff),
+			    (unsigned)a->pid_on_fep,
+			    (unsigned)a->start_index,
+			    (unsigned)a->num_indices,
+			    (unsigned)a->initiator_id);
 			free(a);
 		}
 		break;
