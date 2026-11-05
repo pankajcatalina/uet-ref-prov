@@ -1188,10 +1188,26 @@ int uet_ep_bind_cq(uet_ep_handle_t ep_handle, struct fi_cq_attr *attr,
 	h.a2 = flags;
 	h.a3 = ctx_get(context, NULL, 0);
 
-	/* fi_cq_attr is flat - no pointers - so it crosses verbatim */
-	rc = shim_rpc(SHIM_EP_BIND_CQ, &h, attr,
-		      (attr != NULL) ? (uint32_t)sizeof(*attr) : 0,
-		      NULL, 0, NULL);
+	/*
+	 * fi_cq_attr is flat - no pointers - so its stable PREFIX crosses
+	 * verbatim. Send SHIM_CQ_ATTR_WIRE, never sizeof(*attr): the two
+	 * sides are built against different libfabrics and the struct has
+	 * already grown once. See SHIM_CQ_ATTR_WIRE in uet_shim.h.
+	 */
+	{
+		char wire[SHIM_CQ_ATTR_WIRE];
+
+		if (attr != NULL) {
+			memset(wire, 0, sizeof(wire));
+			memcpy(wire, attr,
+			       (sizeof(*attr) < SHIM_CQ_ATTR_WIRE) ?
+			       sizeof(*attr) : SHIM_CQ_ATTR_WIRE);
+		}
+		rc = shim_rpc(SHIM_EP_BIND_CQ, &h,
+			      (attr != NULL) ? wire : NULL,
+			      (attr != NULL) ? SHIM_CQ_ATTR_WIRE : 0,
+			      NULL, 0, NULL);
+	}
 	if (rc < 0)
 		return (int)rc;
 	*cq_handle = shim_h2p(h.h2);

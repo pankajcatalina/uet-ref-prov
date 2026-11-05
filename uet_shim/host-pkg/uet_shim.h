@@ -251,6 +251,33 @@ enum shim_op {
  */
 #define SHIM_DEV_MAX_SGE   4
 
+/*
+ * How many bytes of struct fi_cq_attr cross the boundary.
+ *
+ * NOT sizeof(struct fi_cq_attr). That is a libfabric type and libfabric
+ * grows it: 2.7.0 appended `struct fid_xpu_ctx *xpu_ctx` and the struct
+ * went from 40 bytes to 48. The two sides of this shim are compiled
+ * against whatever libfabric each was built with - the host against the
+ * one the NCCL pipeline loads, the guest against the one beside libuet -
+ * so sizeof is not a shared quantity and must never appear on the wire.
+ *
+ * It did, and the failure was silent and remote from its cause: the host
+ * sent 40 bytes, the guest required >= its own 48 and so saw no attr at
+ * all, defaulted the CQ stride to fi_cq_tagged_entry (48) while libuet,
+ * handed a NULL attr, chose fi_cq_entry (8). Every completion then read
+ * its op_context correctly - first field of every format - and its flags
+ * and len from the bytes after it. No flags meant no FI_RECV, so the
+ * mirror's copy-back never ran and received data never reached the
+ * arena. NCCL surfaced it four layers up as a connection failure, on an
+ * address that arrived as 32 zero bytes.
+ *
+ * The first 40 bytes - size, flags, format, wait_obj, signaling_vector,
+ * wait_cond, wait_set - have been stable since libfabric 1.x. Both sides
+ * send and expect exactly those, and anything a newer libfabric appends
+ * stays local to the side that knows about it.
+ */
+#define SHIM_CQ_ATTR_WIRE  40u
+
 /* Which opcodes prefix their payload with struct shim_tag_args. Kept
  * beside the IDL that says so, rather than as a list in one .c file. */
 static inline int shim_op_has_tag_args(uint32_t op)

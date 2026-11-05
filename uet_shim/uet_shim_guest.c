@@ -818,9 +818,31 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 
 	case SHIM_EP_BIND_CQ: {
 		uet_cq_handle_t ch = NULL;
-		struct fi_cq_attr *attr =
-			(req->payload_len >= sizeof(struct fi_cq_attr)) ?
-			(struct fi_cq_attr *)g_in : NULL;
+		struct fi_cq_attr attr_buf;
+		struct fi_cq_attr *attr = NULL;
+
+		/*
+		 * Take the stable PREFIX, never sizeof(struct fi_cq_attr):
+		 * ours may be bigger than the host's. It was - 48 here
+		 * against 40 there, because this libfabric is 2.7.0 and
+		 * appended xpu_ctx - so this test failed on a payload that
+		 * was perfectly good, attr became NULL, and the stride we
+		 * reported disagreed with the one libuet chose. See
+		 * SHIM_CQ_ATTR_WIRE in uet_shim.h for what that cost.
+		 *
+		 * Zero first, then copy the prefix: whatever a newer
+		 * libfabric appended is not on the wire and must not be
+		 * left holding stack garbage.
+		 */
+		if (req->payload_len >= SHIM_CQ_ATTR_WIRE) {
+			memset(&attr_buf, 0, sizeof(attr_buf));
+			memcpy(&attr_buf, g_in, SHIM_CQ_ATTR_WIRE);
+			attr = &attr_buf;
+		} else if (req->payload_len != 0) {
+			LOG("EP_BIND_CQ   payload is %u bytes, need %u: "
+			    "binding with no attr\n",
+			    req->payload_len, (unsigned)SHIM_CQ_ATTR_WIRE);
+		}
 
 		/*
 		 * PIN THE FORMAT BEFORE BINDING, or the backend and we pick
