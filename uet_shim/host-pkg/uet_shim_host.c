@@ -350,9 +350,11 @@ struct mr_ent {
 	size_t        len;
 	uint64_t      off;       /* arena offset of the shadow       */
 	uint64_t      access;
+	uint64_t      gen;       /* registration order; newest wins  */
 };
 
 static struct mr_ent   mr_tbl[MR_MAX];
+static uint64_t        mr_gen;
 static pthread_mutex_t mr_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*
@@ -386,7 +388,7 @@ static int shim_trace(void)
 static uint64_t mr_off_for(const void *buf, size_t len)
 {
 	const char *p = buf;
-	uint64_t off = 0;
+	uint64_t off = 0, best_gen = 0;
 	size_t i;
 
 	/*
@@ -400,15 +402,30 @@ static uint64_t mr_off_for(const void *buf, size_t len)
 	if (buf == NULL)
 		return 0;
 
+	/*
+	 * NEWEST match wins, so this cannot stop at the first.
+	 *
+	 * An application may register the same memory twice: NCCL closes an
+	 * endpoint whose receives are still posted, so uet_mr_disable()
+	 * answers -FI_EBUSY, the plugin gives up on the region and never
+	 * calls uet_mr_close() at all - then builds a fresh domain and
+	 * registers the SAME buffer again. Both entries then contain the
+	 * pointer, and taking the first returned the DEAD region's arena
+	 * offset for a receive posted against the live one. The guest
+	 * resolved it, the offset lay outside the new region, and
+	 * uet_seg_validate() refused the work request: CQE_ERR_LOCAL, which
+	 * the application sees as a receive completing with -FI_EINVAL.
+	 */
 	pthread_mutex_lock(&mr_lock);
 	for (i = 0; i < MR_MAX; i++) {
 		const char *b = mr_tbl[i].ubuf;
 
 		if (!mr_tbl[i].used || (b == NULL))
 			continue;
-		if ((p >= b) && ((p + len) <= (b + mr_tbl[i].len))) {
+		if ((p >= b) && ((p + len) <= (b + mr_tbl[i].len)) &&
+		    (mr_tbl[i].gen > best_gen)) {
+			best_gen = mr_tbl[i].gen;
 			off = mr_tbl[i].off + (uint64_t)(p - b);
-			break;
 		}
 	}
 	pthread_mutex_unlock(&mr_lock);
@@ -1259,6 +1276,43 @@ int uet_mr_reg(uet_domain_handle_t domain_handle, const void *buf, size_t len,
 	/* remember the mapping so mr_off_for() can spot buffers that live
 	 * inside this region, and mr_sync_in() can copy it back */
 	pthread_mutex_lock(&mr_lock);
+
+	/*
+	 * Retire any mapping this one supersedes FIRST.
+	 *
+	 * Registering memory that an existing entry already covers means
+	 * the application has finished with that region, whatever it did
+	 * or did not close: nothing can legitimately reach the old arena
+	 * block through this pointer again. Leaving the entry behind let
+	 * mr_sync_in() copy a dead block over live data, and made the
+	 * table fill up over a long run.
+	 *
+	 * The arena block is deliberately NOT freed. The stack may still
+	 * hold the old region - that is exactly how we got here, with
+	 * uet_mr_disable() answering -FI_EBUSY - and handing those bytes
+	 * to the next allocation would alias them under it. A bounded leak
+	 * of regions the application abandoned beats silent corruption.
+	 */
+	if (buf != NULL) {
+		const char *nb = buf;
+
+		for (i = 0; i < MR_MAX; i++) {
+			const char *ob = mr_tbl[i].ubuf;
+
+			if (!mr_tbl[i].used || (ob == NULL))
+				continue;
+			if ((nb < (ob + mr_tbl[i].len)) &&
+			    (ob < (nb + len))) {
+				fprintf(stderr, "[shim/host] mr_reg: "
+					"superseding the mapping of %p+%zu "
+					"(arena 0x%016llx, never closed)\n",
+					(void *)ob, mr_tbl[i].len,
+					(unsigned long long)mr_tbl[i].off);
+				memset(&mr_tbl[i], 0, sizeof(mr_tbl[i]));
+			}
+		}
+	}
+
 	for (i = 0; i < MR_MAX; i++) {
 		if (mr_tbl[i].used)
 			continue;
@@ -1268,6 +1322,7 @@ int uet_mr_reg(uet_domain_handle_t domain_handle, const void *buf, size_t len,
 		mr_tbl[i].len    = len;
 		mr_tbl[i].off    = off;
 		mr_tbl[i].access = access;
+		mr_tbl[i].gen    = ++mr_gen;
 		break;
 	}
 	pthread_mutex_unlock(&mr_lock);

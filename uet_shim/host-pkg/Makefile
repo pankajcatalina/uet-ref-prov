@@ -124,8 +124,20 @@ uet_shim_guest_dev: uet_shim_guest_dev.o uet_shim_stubs.o $(COMMON)
 	      -Wl,-rpath,$(abspath $(LIBUET)) $(RPATH_LF)
 	@echo
 	@echo "linked against libuet: control via uet.ko, data via uet-pci"
-	@nm -D --undefined-only $@ | grep -c ' uet_' | \
-	   xargs -I{} echo "  unresolved uet_* symbols: {} (must be 0)"
+# The uet_* symbols stay UNDEFINED on purpose: libuet.so supplies them at
+# load time. Counting them says nothing, so check the thing that can
+# actually be wrong - that libuet.so really defines every one of them.
+	@{ nm -D --defined-only $(LIBUET)/libuet.so | sed 's/^/D /'; \
+	   nm -D --undefined-only $@              | sed 's/^/U /'; } | \
+	 awk '$$1 == "D" && $$NF ~ /^uet_/ { have[$$NF] = 1 } \
+	      $$1 == "U" && $$NF ~ /^uet_/ { n++; \
+	              if (!($$NF in have)) { miss[$$NF] = 1 } } \
+	      END { printf "  uet_* resolved from libuet.so at load time: %d\n", n; \
+	            for (s in miss) { \
+	                    if (!k++) { print "  MISSING - libuet.so does not define:" } \
+	                    print "    " s } \
+	            if (k) { exit 1 } \
+	            print "  every one is defined by libuet.so: ok" }'
 
 # A drop-in replacement for libuet_fabric.so. libuetprov-fi.so leaves the 25
 # uet_* symbols UNDEFINED and resolves them from the process's global scope at
