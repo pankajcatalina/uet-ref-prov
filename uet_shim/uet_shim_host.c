@@ -565,6 +565,75 @@ static int stage_iov(const struct iovec *iov, size_t n,
 		return 0;
 	}
 
+	/*
+	 * PREFER THE REGISTERED REGION, as stage_tx() and stage_rx() do.
+	 *
+	 * A fresh block is not interchangeable with the region's own one
+	 * once the operation names an MR. Over libuet the iovec becomes
+	 * device SGEs carrying that MR's lkey, the device turns those into
+	 * a uet_embed_seg[], and the stack then takes its SEGMENT path -
+	 * where uet_seg_validate() requires every segment to lie inside
+	 * the region it names. A landing zone in ARENA_G never does, so
+	 * the work request was refused: "Invalid segment list", surfacing
+	 * as a tagged receive completing with -FI_EINVAL.
+	 *
+	 * In-process this never arose. There the shim hands uet_trecvv()
+	 * an iovec and the stack takes its IOV path, which only sums the
+	 * lengths - no region, nothing to be outside of. The device path
+	 * imposes a constraint the in-process path does not have, and this
+	 * function predates it.
+	 *
+	 * Only for segments that are CONTIGUOUS AND ASCENDING in memory,
+	 * which is what lets tbl[i].off stay a running total: the receive
+	 * copy-back in uet_cq_read() walks the segments by accumulated
+	 * length, so a layout where address deltas and lengths disagree
+	 * would scatter the bytes to the wrong places. One segment - what
+	 * NCCL posts here - satisfies it trivially. Anything else falls
+	 * through to a fresh block, which is always safe because the
+	 * caller then passes no MR worth validating against.
+	 */
+	{
+		int contiguous = 1;
+
+		for (i = 1; i < n; i++) {
+			const char *end = (const char *)iov[i - 1].iov_base +
+					  iov[i - 1].iov_len;
+
+			if ((iov[i - 1].iov_base == NULL) ||
+			    ((const char *)iov[i].iov_base != end)) {
+				contiguous = 0;
+				break;
+			}
+		}
+
+		if (contiguous && (iov[0].iov_base != NULL)) {
+			uint64_t base = mr_off_for(iov[0].iov_base, total);
+
+			if (base != 0) {
+				st->off = base;
+				st->owned = 0;   /* the region owns it */
+				for (i = 0; i < n; i++) {
+					tbl[i].off = cur;
+					tbl[i].len = iov[i].iov_len;
+					if (copy_in && (iov[i].iov_len > 0)) {
+						void *dst = shim_arena_ptr(
+							base + cur,
+							iov[i].iov_len);
+
+						if (dst == NULL) {
+							st->off = 0;
+							return -FI_EINVAL;
+						}
+						memcpy(dst, iov[i].iov_base,
+						       iov[i].iov_len);
+					}
+					cur += iov[i].iov_len;
+				}
+				return 0;
+			}
+		}
+	}
+
 	st->off = shim_arena_alloc(reg, total);
 	if (st->off == 0) {
 		fprintf(stderr, "[shim/host] stage_iov: no arena space for "
