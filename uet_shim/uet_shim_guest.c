@@ -489,8 +489,17 @@ static void rx_deliver(uint64_t ctx, size_t got)
 		return;
 
 	r = &g_rx[ctx];
-	if (!r->used)
+	if (!r->used) {
+		/* The ONLY path that moves received bytes into the arena, so
+		 * a miss here is silent data loss: the host reads whatever
+		 * the block held before. In-process there is no mirror and
+		 * the stack writes the arena directly, so this cannot
+		 * happen there - which is why it only shows on the device. */
+		LOG("rx_deliver ctx=%llu got=%zu: NO RECORD - %zu bytes "
+		    "stay in the mirror and the host reads stale arena\n",
+		    (unsigned long long)ctx, got, got);
 		return;
+	}
 
 	for (i = 0; (i < r->n) && (got > 0); i++) {
 		size_t take = (got < r->seg[i].len) ? got : r->seg[i].len;
@@ -499,8 +508,20 @@ static void rx_deliver(uint64_t ctx, size_t got)
 		void *src = mirror_in(SHIM_RECV, r->seg[i].off, take,
 				      &ignored);
 
-		if ((dst != NULL) && (src != NULL) && (take > 0))
+		if ((dst != NULL) && (src != NULL) && (take > 0)) {
 			memcpy(dst, src, take);
+			if (g_verbose)
+				LOG("rx_deliver ctx=%llu seg%u off=0x%016llx "
+				    "copied %zu of %zu\n",
+				    (unsigned long long)ctx, i,
+				    (unsigned long long)r->seg[i].off,
+				    take, r->seg[i].len);
+		} else {
+			LOG("rx_deliver ctx=%llu seg%u off=0x%016llx take=%zu "
+			    "NOT COPIED (arena=%p mirror=%p)\n",
+			    (unsigned long long)ctx, i,
+			    (unsigned long long)r->seg[i].off, take, dst, src);
+		}
 		got -= take;
 	}
 	r->used = 0;
@@ -1009,6 +1030,15 @@ static void handle_one(const struct shim_hdr *req, struct shim_hdr *rsp)
 					(const void *)((char *)g_out +
 						       (size_t)k * entry_sz);
 
+				if (g_verbose)
+					LOG("CQE ctx=%llu flags=0x%llx "
+					    "len=%zu%s\n",
+					    (unsigned long long)(uintptr_t)
+						e->op_context,
+					    (unsigned long long)e->flags,
+					    (size_t)e->len,
+					    (e->flags & FI_RECV) ?
+						"" : " (not a receive)");
 				if (e->flags & FI_RECV)
 					rx_deliver((uint64_t)(uintptr_t)
 						   e->op_context, e->len);
